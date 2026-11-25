@@ -207,7 +207,7 @@ impl Source {
     }
     pub fn show(&mut self, ui: &mut egui::Ui, current: bool) {
         let mut kind = self.kind;
-        ui.label("Source type");
+        crate::ui::component_field_label(ui, "Source type");
         egui::ComboBox::from_id_salt("source type")
             .width(crate::ui::COMPONENT_FIELD_WIDTH)
             .selected_text(kind.spec().0)

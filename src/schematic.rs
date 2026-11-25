@@ -1588,7 +1588,7 @@ impl Schematic {
             let valid = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 28.;
                     egui::Grid::new("component fields")
-                        .min_col_width(112.)
+                        .min_col_width(crate::ui::COMPONENT_LABEL_WIDTH)
                         .spacing(vec2(10., 6.))
                         .show(ui, |ui| {
                             crate::ui::component_field(ui, "Reference", &mut edit.reference);
@@ -1599,7 +1599,7 @@ impl Schematic {
                                 let original = edit.value.split_whitespace().next().unwrap_or("").to_owned();
                                 let was_ideal = matches!(original.as_str(), "os_diode_piecewise" | "os_diode_ideal");
                                 let mut ideal = was_ideal;
-                                ui.label("Model");
+                                crate::ui::component_field_label(ui, "Model");
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut ideal, true, "Idealized");
                                     ui.selectable_value(&mut ideal, false, "Realistic");
@@ -1607,7 +1607,7 @@ impl Schematic {
                                 ui.end_row();
                                 let mut kind = diode_type(&original).0;
                                 if !ideal {
-                                    ui.label("Diode type");
+                                    crate::ui::component_field_label(ui, "Diode type");
                                     egui::ComboBox::from_id_salt("diode type")
                                         .width(crate::ui::COMPONENT_FIELD_WIDTH)
                                         .selected_text(diode_type(kind).1).show_ui(ui, |ui| {
@@ -1629,7 +1629,7 @@ impl Schematic {
                                 }
                                 edit.value = definition;
                             } else if edit.part.spec().0 == 'X' {
-                                ui.label("Model");
+                                crate::ui::component_field_label(ui, "Model");
                                 ui.strong(edit.part.spec().1);
                                 ui.end_row();
                                 for ((_, label), v) in
@@ -1654,7 +1654,7 @@ impl Schematic {
                                         };
                                         let bit = 1 << index;
                                         let mut reversed = edit.winding_polarity & bit != 0;
-                                        ui.label(name);
+                                        crate::ui::component_field_label(ui, &name);
                                         if ui.checkbox(&mut reversed, "Reverse polarity").changed()
                                         {
                                             edit.winding_polarity ^= bit;

@@ -157,9 +157,21 @@ pub(crate) fn dialog_field(ui: &mut Ui, label: &str, value: &mut String) {
 }
 
 pub(crate) const COMPONENT_FIELD_WIDTH: f32 = 175.;
+pub(crate) const COMPONENT_LABEL_WIDTH: f32 = 122.;
+
+pub(crate) fn component_field_label(ui: &mut Ui, label: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(COMPONENT_LABEL_WIDTH, 0.),
+        Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(COMPONENT_LABEL_WIDTH);
+            ui.add(egui::Label::new(label).wrap());
+        },
+    );
+}
 
 pub(crate) fn component_field(ui: &mut Ui, label: &str, value: &mut String) {
-    ui.add_sized([112., 28.], egui::Label::new(label).wrap());
+    component_field_label(ui, label);
     ui.add(
         TextEdit::singleline(value)
             .desired_width(COMPONENT_FIELD_WIDTH)
@@ -1729,8 +1741,9 @@ impl Workbench {
         if self.schematic.editor_open() || self.schematic.selector_open {
             Panel::right("component editor")
                 .resizable(true)
+                .show_separator_line(false)
                 .default_size(350.)
-                .min_size(325.)
+                .min_size(345.)
                 .frame(pane_frame)
                 .show(ui, |ui| {
                     if self.schematic.selector_open {
