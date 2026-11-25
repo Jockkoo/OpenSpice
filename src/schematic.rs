@@ -2,13 +2,14 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Stroke, Ui, vec2};
 use std::collections::{HashMap, HashSet};
 
 const SCHEMATIC_STROKE: f32 = 1.6;
-const PAPER: Color32 = Color32::WHITE;
-const WIRE: Color32 = Color32::from_rgb(0, 128, 35);
-const INK: Color32 = Color32::from_rgb(135, 15, 24);
-const LABEL: Color32 = Color32::from_rgb(0, 108, 116);
-const ACCENT: Color32 = Color32::from_rgb(35, 111, 211);
+pub(crate) const PAPER: Color32 = Color32::from_rgb(29, 32, 37);
+const WIRE: Color32 = Color32::from_rgb(118, 199, 155);
+const INK: Color32 = Color32::from_rgb(233, 210, 181);
+const LABEL: Color32 = Color32::from_rgb(149, 210, 222);
+const ACCENT: Color32 = Color32::from_rgb(101, 177, 255);
 pub(crate) const GRID: f32 = 14.;
 const PIN_OFFSET: f32 = 2. * GRID;
+const WINDING_HALF_SPAN: i32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash)]
 pub(crate) enum Part {
@@ -29,6 +30,49 @@ pub(crate) enum Part {
     OpRail,
     Pole,
     Transformer,
+    CenterTappedTransformer,
+    CustomTransformer { inputs: u8, outputs: u8 },
+}
+
+const MAX_TRANSFORMER_WINDINGS: u8 = 8;
+
+fn winding_centers(count: u8, half_pitch: i32) -> impl Iterator<Item = i32> {
+    (0..i32::from(count)).map(move |index| half_pitch * (2 * index - i32::from(count) + 1))
+}
+
+// The low two bits keep the saved quarter turns. Bit 2 reflects the
+// rotated symbol left-to-right in schematic coordinates.
+const MIRRORED: u8 = 4;
+
+fn orient_offset<T: std::ops::Neg<Output = T>>((x, y): (T, T), orientation: u8) -> (T, T) {
+    let (x, y) = match orientation % 4 {
+        0 => (x, y),
+        1 => (-y, x),
+        2 => (-x, -y),
+        _ => (y, -x),
+    };
+    (if orientation & MIRRORED != 0 { -x } else { x }, y)
+}
+
+#[derive(Clone, Copy)]
+enum OrientationEdit {
+    Rotate,
+    MirrorHorizontal,
+    MirrorVertical,
+}
+
+impl OrientationEdit {
+    fn apply(self, orientation: u8) -> u8 {
+        match self {
+            Self::Rotate => {
+                let mirror = orientation & MIRRORED;
+                let step = if mirror == 0 { 1 } else { 3 };
+                mirror | ((orientation % 4 + step) % 4)
+            }
+            Self::MirrorHorizontal => orientation ^ MIRRORED,
+            Self::MirrorVertical => orientation ^ (MIRRORED | 2),
+        }
+    }
 }
 
 const DIODES: [(&str, &str); 5] = [
@@ -60,7 +104,7 @@ impl Part {
         Self::Current,
     ];
 
-    const LIBRARY: [Self; 12] = [
+    const LIBRARY: [Self; 14] = [
         Self::Diode,
         Self::Npn,
         Self::Pnp,
@@ -73,6 +117,11 @@ impl Part {
         Self::OpRail,
         Self::Pole,
         Self::Transformer,
+        Self::CenterTappedTransformer,
+        Self::CustomTransformer {
+            inputs: 1,
+            outputs: 2,
+        },
     ];
     fn layout(self) -> &'static [(i32, i32, &'static str)] {
         match self {
@@ -88,27 +137,138 @@ impl Part {
                 (0, -2, "+"),
                 (0, 2, "−"),
             ],
-            Self::Transformer => &[(-2, -1, ""), (-2, 1, ""), (2, -1, ""), (2, 1, "")],
+            Self::Transformer => &[
+                (-2, -WINDING_HALF_SPAN, ""),
+                (-2, WINDING_HALF_SPAN, ""),
+                (2, -WINDING_HALF_SPAN, ""),
+                (2, WINDING_HALF_SPAN, ""),
+            ],
+            Self::CenterTappedTransformer => &[
+                (-2, -WINDING_HALF_SPAN, ""),
+                (-2, WINDING_HALF_SPAN, ""),
+                (2, -2 * WINDING_HALF_SPAN, ""),
+                (2, 0, ""),
+                (2, 2 * WINDING_HALF_SPAN, ""),
+            ],
             _ => &[(-2, 0, ""), (2, 0, "")],
         }
     }
+    fn transformer_windings(self) -> Option<(u8, u8)> {
+        match self {
+            Self::Transformer | Self::CenterTappedTransformer => Some((1, 1)),
+            Self::CustomTransformer { inputs, outputs } => Some((inputs, outputs)),
+            _ => None,
+        }
+    }
+
+    fn pin_count(self) -> usize {
+        match self {
+            Self::CustomTransformer { inputs, outputs } => {
+                2 * (usize::from(inputs) + usize::from(outputs))
+            }
+            _ => self.layout().len(),
+        }
+    }
+
+    fn custom_transformer(model: &str) -> Option<Self> {
+        const PREFIX: &str = "os_xfmr_multi_";
+        let (prefix, windings) = model.split_at_checked(PREFIX.len())?;
+        if !prefix.eq_ignore_ascii_case(PREFIX) {
+            return None;
+        }
+        let (inputs, outputs) = windings.split_once('_')?;
+        let (inputs, outputs) = (inputs.parse().ok()?, outputs.parse().ok()?);
+        let range = 1..=MAX_TRANSFORMER_WINDINGS;
+        (range.contains(&inputs) && range.contains(&outputs))
+            .then_some(Self::CustomTransformer { inputs, outputs })
+    }
+
     fn terminals(self, center: Point, turns: u8) -> Vec<Point> {
+        let rotate = |offset| {
+            let (x, y) = orient_offset(offset, turns);
+            (center.0 + x, center.1 + y)
+        };
+        if let Self::CustomTransformer { inputs, outputs } = self {
+            return [(-2, inputs), (2, outputs)]
+                .into_iter()
+                .flat_map(|(x, count)| {
+                    winding_centers(count, 3)
+                        .flat_map(move |y| [(x, y - WINDING_HALF_SPAN), (x, y + WINDING_HALF_SPAN)])
+                })
+                .map(rotate)
+                .collect();
+        }
         self.layout()
             .iter()
-            .map(|&(x, y, _)| {
-                let (x, y) = match turns % 4 {
-                    0 => (x, y),
-                    1 => (-y, x),
-                    2 => (-x, -y),
-                    _ => (y, -x),
-                };
-                (center.0 + x, center.1 + y)
-            })
+            .map(|&(x, y, _)| rotate((x, y)))
             .collect()
     }
+    fn adjustable_transistor_model(self) -> Option<&'static str> {
+        match self {
+            Self::Npn => Some("os_npn_adjust"),
+            Self::Pnp => Some("os_pnp_adjust"),
+            Self::Nmos => Some("os_nmos_adjust"),
+            Self::Pmos => Some("os_pmos_adjust"),
+            Self::Njfet => Some("os_njfet_adjust"),
+            Self::Pjfet => Some("os_pjfet_adjust"),
+            _ => None,
+        }
+    }
+
+    fn current_probe_terminal(self) -> usize {
+        match self {
+            Self::Op | Self::OpRail | Self::Pole => 2,
+            _ => 0,
+        }
+    }
+
+    fn current_probe_direction(self, orientation: u8) -> egui::Vec2 {
+        let pin = self.terminals((0, 0), 0)[self.current_probe_terminal()];
+        let inward = if self.transformer_windings().is_some() || pin.0.abs() >= pin.1.abs() {
+            (-pin.0.signum(), 0)
+        } else {
+            (0, -pin.1.signum())
+        };
+        let (x, y) = orient_offset(inward, orientation);
+        vec2(x as f32, y as f32)
+    }
+
     fn parameters(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Transformer => &[("ratio", "Turns ratio (Ns/Np)")],
+            Self::Npn | Self::Pnp => &[
+                ("bf", "BF · Forward current gain"),
+                ("is", "IS · Saturation current (A)"),
+                ("nf", "NF · Forward emission factor"),
+                ("vaf", "VAF · Forward Early voltage (V)"),
+                ("rb", "RB · Base resistance (Ω)"),
+                ("rc", "RC · Collector resistance (Ω)"),
+                ("re", "RE · Emitter resistance (Ω)"),
+                ("cje", "CJE · Base–emitter capacitance (F)"),
+                ("cjc", "CJC · Base–collector capacitance (F)"),
+                ("tf", "TF · Forward transit time (s)"),
+            ],
+            Self::Nmos | Self::Pmos => &[
+                ("vto", "VTO · Threshold voltage (V)"),
+                ("kp", "KP · Transconductance (A/V²)"),
+                ("lambda", "LAMBDA · Channel-length mod. (1/V)"),
+                ("rd", "RD · Drain resistance (Ω)"),
+                ("rs", "RS · Source resistance (Ω)"),
+                ("cgso", "CGSO · Gate–source overlap (F/m)"),
+                ("cgdo", "CGDO · Gate–drain overlap (F/m)"),
+            ],
+            Self::Njfet | Self::Pjfet => &[
+                ("vto", "VTO · Cutoff voltage (V)"),
+                ("beta", "BETA · Transconductance (A/V²)"),
+                ("lambda", "LAMBDA · Channel-length mod. (1/V)"),
+                ("rd", "RD · Drain resistance (Ω)"),
+                ("rs", "RS · Source resistance (Ω)"),
+                ("cgs", "CGS · Gate–source capacitance (F)"),
+                ("cgd", "CGD · Gate–drain capacitance (F)"),
+                ("is", "IS · Gate saturation current (A)"),
+            ],
+            Self::Transformer | Self::CenterTappedTransformer | Self::CustomTransformer { .. } => {
+                &[("ratio", "Turns ratio (Ns/Np)")]
+            }
             Self::Op => &[
                 ("vpos", "Positive supply (V)"),
                 ("vneg", "Negative supply (V)"),
@@ -122,9 +282,37 @@ impl Part {
             _ => &[],
         }
     }
+    fn parameter_defaults(self) -> &'static str {
+        self.adjustable_transistor_model()
+            .and_then(|name| {
+                include_str!("../assets/components.lib")
+                    .lines()
+                    .find_map(|line| {
+                        let declaration = line.strip_prefix(".subckt ")?;
+                        let (model, pins_and_params) = declaration.split_once(' ')?;
+                        if model == name {
+                            pins_and_params
+                                .split_once("params: ")
+                                .map(|(_, params)| params)
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .unwrap_or(self.spec().2)
+    }
+
     fn toolbar_icon(self, p: &egui::Painter, center: Pos2, color: Color32, american: bool) {
-        let scale = if self == Self::Voltage { 0.5 } else { 0.39 };
-        draw(p, center, (self, self.spec().2), 1, scale, american, color);
+        let scale = if self == Self::Voltage { 0.56 } else { 0.49 };
+        draw(
+            p,
+            center,
+            (self, self.spec().2),
+            1,
+            scale,
+            american,
+            (color, Color32::TRANSPARENT),
+        );
     }
 
     fn spec(self) -> (char, &'static str, &'static str) {
@@ -154,6 +342,12 @@ impl Part {
                 "os_pole_ext gbw=1meg gain=100k slew=1meg",
             ),
             Self::Transformer => ('X', "Transformer", "os_xfmr ratio=1"),
+            Self::CenterTappedTransformer => {
+                ('X', "Center-tapped transformer", "os_xfmr_ct ratio=1")
+            }
+            Self::CustomTransformer { .. } => {
+                ('X', "Custom transformer", "os_xfmr_multi_1_2 ratio=1")
+            }
         }
     }
 }
@@ -171,6 +365,53 @@ struct Card<'a> {
     nodes: Vec<&'a str>,
     line: usize,
     value: &'a str,
+}
+
+fn transformer_model(model: &str) -> (&str, u16) {
+    model
+        .rsplit_once("_pol_")
+        .and_then(|(base, mask)| mask.parse().ok().map(|mask| (base, mask)))
+        .unwrap_or((model, 0))
+}
+
+fn polarized_transformer_definition(model: &str, base: &str, mask: u16) -> Option<String> {
+    use std::fmt::Write as _;
+    if base.eq_ignore_ascii_case("os_xfmr_ct") {
+        let primary = if mask & 1 == 0 { "p1 p2" } else { "p2 p1" };
+        let upper = if mask & 2 == 0 { "" } else { "-" };
+        let lower = if mask & 4 == 0 { "" } else { "-" };
+        let reflected_upper = if upper.is_empty() { "-" } else { "" };
+        let reflected_lower = if lower.is_empty() { "-" } else { "" };
+        return Some(format!(
+            ".subckt {model} p1 p2 s1 tap s2 params: ratio=1\n\
+             Eupper s1 tap {primary} {{{upper}ratio/2}}\n\
+             Elower tap s2 {primary} {{{lower}ratio/2}}\n\
+             Fupper {primary} Eupper {{{reflected_upper}ratio/2}}\n\
+             Flower {primary} Elower {{{reflected_lower}ratio/2}}\n\
+             Rtapref tap 0 1T\n.ends"
+        ));
+    }
+    let count = if base.eq_ignore_ascii_case("os_xfmr") {
+        4
+    } else {
+        Part::custom_transformer(base)?.pin_count()
+    };
+    let pins: Vec<_> = (1..=count).map(|n| format!("pin{n}")).collect();
+    let mut connection = pins.clone();
+    for (index, pair) in connection.chunks_exact_mut(2).enumerate() {
+        if mask & (1 << index) != 0 {
+            pair.swap(0, 1);
+        }
+    }
+    let mut definition = format!(".subckt {model} {} params: ratio=1\n", pins.join(" "));
+    writeln!(
+        definition,
+        "Xcore {} {base} ratio={{ratio}}",
+        connection.join(" ")
+    )
+    .unwrap();
+    definition.push_str(".ends");
+    Some(definition)
 }
 
 fn cards(text: &str) -> Vec<Card<'_>> {
@@ -208,27 +449,47 @@ fn cards(text: &str) -> Vec<Card<'_>> {
                 let part = if legacy_pole {
                     Some(Part::Pole)
                 } else if prefix == 'X' {
-                    Part::LIBRARY.into_iter().find(|p| {
-                        remainder
-                            .split_whitespace()
-                            .nth(p.layout().len())
-                            .is_some_and(|model| {
-                                (*p == Part::Diode
-                                    && DIODES
-                                        .iter()
-                                        .any(|(key, _)| model.eq_ignore_ascii_case(key)))
-                                    || (*p == Part::Op && model.eq_ignore_ascii_case("os_op"))
-                                    || model.eq_ignore_ascii_case(
-                                        p.spec().2.split_whitespace().next().unwrap(),
-                                    )
+                    remainder
+                        .split_whitespace()
+                        .enumerate()
+                        .find_map(|(index, word)| {
+                            Part::custom_transformer(transformer_model(word).0)
+                                .filter(|part| part.pin_count() == index)
+                        })
+                        .or_else(|| {
+                            Part::LIBRARY.into_iter().find(|p| {
+                                if matches!(p, Part::CustomTransformer { .. }) {
+                                    return false;
+                                }
+                                remainder.split_whitespace().nth(p.pin_count()).is_some_and(
+                                    |model| {
+                                        let model = if p.transformer_windings().is_some() {
+                                            transformer_model(model).0
+                                        } else {
+                                            model
+                                        };
+                                        (*p == Part::Diode
+                                            && DIODES
+                                                .iter()
+                                                .any(|(key, _)| model.eq_ignore_ascii_case(key)))
+                                            || (*p == Part::Op
+                                                && model.eq_ignore_ascii_case("os_op"))
+                                            || p.adjustable_transistor_model().is_some_and(|name| {
+                                                model.eq_ignore_ascii_case(name)
+                                            })
+                                            || model.eq_ignore_ascii_case(
+                                                p.spec().2.split_whitespace().next().unwrap(),
+                                            )
+                                    },
+                                )
                             })
-                    })
+                        })
                 } else {
                     Part::ALL.into_iter().find(|p| prefix == p.spec().0)
                 };
                 if let Some(part) = part {
                     let mut nodes = Vec::new();
-                    let count = if legacy_pole { 3 } else { part.layout().len() };
+                    let count = if legacy_pole { 3 } else { part.pin_count() };
                     for _ in 0..count {
                         let Some((node, rest)) = remainder.split_once(char::is_whitespace) else {
                             break;
@@ -267,20 +528,60 @@ fn ensure_model(text: &mut String, definition: &str) {
     if text.lines().any(declares) {
         return;
     }
-    let mut lines = include_str!("../assets/components.lib")
-        .lines()
-        .skip_while(|l| !declares(l));
-    let mut model: Vec<_> = lines.by_ref().take_while(|l| *l != ".ends").collect();
-    if model.is_empty() {
-        return;
-    }
-    model.push(".ends");
+    let (base, mask) = transformer_model(name);
+    let model = if mask != 0 {
+        let Some(definition) = polarized_transformer_definition(name, base, mask) else {
+            return;
+        };
+        if !base.eq_ignore_ascii_case("os_xfmr_ct") {
+            ensure_model(text, base);
+        }
+        definition
+    } else if let Some(Part::CustomTransformer { inputs, outputs }) = Part::custom_transformer(name)
+    {
+        use std::fmt::Write as _;
+        let mut model = format!(".subckt {name} p1a p1b");
+        for (prefix, start, count) in [('p', 2, inputs), ('s', 1, outputs)] {
+            for n in start..=count {
+                write!(model, " {prefix}{n}a {prefix}{n}b").unwrap();
+            }
+        }
+        // Give floating windings a DC reference without materially loading them.
+        model.push_str(" params: ratio=1\nRp1ref p1b 0 1T\n");
+        // Each ideal winding has its own voltage source. A current-controlled
+        // source reflects that winding's load back to the reference primary.
+        for (prefix, start, count, gain, reflected) in [
+            ('p', 2, inputs, "1", "-1"),
+            ('s', 1, outputs, "{ratio}", "{-ratio}"),
+        ] {
+            for n in start..=count {
+                writeln!(
+                    model,
+                    "E{prefix}{n} {prefix}{n}a {prefix}{n}b p1a p1b {gain}"
+                )
+                .unwrap();
+                writeln!(model, "F{prefix}{n} p1a p1b E{prefix}{n} {reflected}").unwrap();
+                writeln!(model, "R{prefix}{n}ref {prefix}{n}b 0 1T").unwrap();
+            }
+        }
+        model.push_str(".ends");
+        model
+    } else {
+        let mut lines = include_str!("../assets/components.lib")
+            .lines()
+            .skip_while(|l| !declares(l));
+        let mut model: Vec<_> = lines.by_ref().take_while(|l| *l != ".ends").collect();
+        if model.is_empty() {
+            return;
+        }
+        model.push(".ends");
+        model.join("\n")
+    };
     let mut deck: Vec<_> = text.lines().collect();
     let end = deck
         .iter()
         .position(|l| l.trim().eq_ignore_ascii_case(".end"))
         .unwrap_or(deck.len());
-    let model = model.join("\n");
     deck.insert(end, &model);
     *text = deck.join("\n") + "\n";
 }
@@ -386,10 +687,7 @@ pub fn instrument_currents(text: &str) -> (String, Vec<(String, String)>) {
                 break (meter, node);
             }
         };
-        let terminal = match card.part {
-            Part::Op | Part::OpRail | Part::Pole => 2,
-            _ => 0,
-        };
+        let terminal = card.part.current_probe_terminal();
         let mut nodes: Vec<String> = card.nodes.iter().map(|n| (*n).to_owned()).collect();
         let external = std::mem::replace(&mut nodes[terminal], node.clone());
         let (value, parasitics) = split_parasitics(card.part, card.value);
@@ -461,11 +759,13 @@ pub(crate) enum Tool {
     Copy,
     Power,
     Ground,
+    Comment,
 }
 
 struct Properties {
     part: Part,
     parameters: Vec<String>,
+    winding_polarity: u16,
     parasitics: Vec<String>,
     source: Option<crate::source::Source>,
     original: String,
@@ -485,8 +785,38 @@ fn rail_net(voltage: Option<f64>) -> String {
     }
 }
 
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Comment {
+    position: Point,
+    text: String,
+}
+
+struct CommentEdit {
+    index: usize,
+    draft: Comment,
+    focus: bool,
+}
+
+const COMMENT_FONT_SIZE: f32 = 15.;
+const LABEL_NAME_SIZE: f32 = 12.;
+const LABEL_VALUE_SIZE: f32 = 10.;
+const LABEL_CLEARANCE: f32 = 8.;
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum LabelPlacement {
+    Offset(f32, f32),
+    Hidden,
+}
+
 #[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Geometry {
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    extended_transformer_primaries: bool,
+    #[serde(default)]
+    wide_transformer_windings: bool,
+    #[serde(default)]
+    full_center_tapped_secondary: bool,
     rotations: HashMap<String, u8>,
     positions: HashMap<String, Point>,
     wires: Vec<Wire>,
@@ -496,6 +826,22 @@ pub struct Geometry {
     power_voltages: HashMap<Point, f64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     power_turns: HashMap<Point, u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    comments: Vec<Comment>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    labels: HashMap<String, LabelPlacement>,
+}
+
+impl Geometry {
+    pub(crate) fn same_circuit(&self, other: &Self) -> bool {
+        self.rotations == other.rotations
+            && self.positions == other.positions
+            && self.wires == other.wires
+            && self.grounds == other.grounds
+            && self.powers == other.powers
+            && self.power_voltages == other.power_voltages
+            && self.power_turns == other.power_turns
+    }
 }
 
 struct OperatingPoint {
@@ -507,8 +853,10 @@ struct OperatingPoint {
 #[derive(Default)]
 pub struct Schematic {
     pub american_resistor: bool,
+    pub light_canvas: bool,
     kinds: HashMap<String, Part>,
     editing: Option<Properties>,
+    transformer_setup: Option<(u8, u8)>,
     rotations: HashMap<String, u8>,
     preview_turns: u8,
     zoom_steps: f32,
@@ -523,9 +871,14 @@ pub struct Schematic {
     power_turns: HashMap<Point, u8>,
     preview_voltage: Option<f64>,
     editing_power: Option<(Point, String)>,
+    comments: Vec<Comment>,
+    labels: HashMap<String, LabelPlacement>,
+    editing_comment: Option<CommentEdit>,
+    new_comment: Option<Comment>,
     drag_leads: Vec<(Point, Point)>,
     pub(crate) tool: Tool,
     pub fit_pending: bool,
+    pub center_pending: bool,
     start: Option<Point>,
     dragging_part: bool,
     selected: HashSet<Object>,
@@ -533,8 +886,9 @@ pub struct Schematic {
     gesture: Option<Gesture>,
     copy_anchor: Option<Point>,
     operating_point: Option<OperatingPoint>,
+    voltage_drag: Option<String>,
     snapshot: String,
-    label_layout: Option<Vec<egui::Rect>>,
+    label_layout: Option<HashMap<String, egui::Rect>>,
 }
 
 #[derive(Clone, Copy)]
@@ -549,6 +903,14 @@ enum Object {
     Power(usize),
     Ground(usize),
     Wire(usize),
+    Comment(usize),
+    Label(String),
+}
+
+impl Object {
+    fn is_annotation(&self) -> bool {
+        matches!(self, Self::Comment(_) | Self::Label(_))
+    }
 }
 
 impl Schematic {
@@ -580,6 +942,9 @@ impl Schematic {
 
     pub fn geometry(&self) -> Geometry {
         Geometry {
+            extended_transformer_primaries: false,
+            wide_transformer_windings: true,
+            full_center_tapped_secondary: true,
             rotations: self.rotations.clone(),
             positions: self.positions.clone(),
             wires: self.wires.clone(),
@@ -587,10 +952,11 @@ impl Schematic {
             powers: self.powers.clone(),
             power_voltages: self.power_voltages.clone(),
             power_turns: self.power_turns.clone(),
+            comments: self.comments.clone(),
+            labels: self.labels.clone(),
         }
     }
     fn set_geometry(&mut self, g: Geometry) {
-        self.label_layout = None;
         self.rotations = g.rotations;
         self.positions = g.positions;
         self.wires = g.wires;
@@ -598,6 +964,8 @@ impl Schematic {
         self.powers = g.powers;
         self.power_voltages = g.power_voltages;
         self.power_turns = g.power_turns;
+        self.comments = g.comments;
+        self.labels = g.labels;
     }
     pub fn matches_document(g: &Geometry, text: &str) -> bool {
         let parts = cards(text);
@@ -606,10 +974,18 @@ impl Schematic {
             .all(|(p, v)| g.powers.contains(p) && v.is_finite())
             && parts.len() == g.positions.len()
             && parts.iter().all(|c| g.positions.contains_key(c.name))
+            && g.labels.iter().all(|(name, placement)| {
+                g.positions.contains_key(name)
+                    && match placement {
+                        LabelPlacement::Hidden => true,
+                        LabelPlacement::Offset(x, y) => x.is_finite() && y.is_finite(),
+                    }
+            })
             && g.positions
                 .values()
                 .chain(&g.grounds)
                 .chain(&g.powers)
+                .chain(g.comments.iter().map(|comment| &comment.position))
                 .chain(g.wires.iter().flat_map(|(a, b)| [a, b]))
                 .all(|&(x, y)| x.unsigned_abs() <= 1_000_000 && y.unsigned_abs() <= 1_000_000)
     }
@@ -618,12 +994,106 @@ impl Schematic {
         self.drag_leads.clear();
         self.editing = None;
         self.editing_power = None;
+        self.editing_comment = None;
+        self.new_comment = None;
         self.selected.clear();
+        let wide_windings = g.wide_transformer_windings;
+        let extended_primaries = g.extended_transformer_primaries;
+        let migrate_transformers = !wide_windings || !g.full_center_tapped_secondary;
         self.set_geometry(g);
         self.index_parts(text);
+        if migrate_transformers {
+            self.migrate_transformer_connections(wide_windings, extended_primaries);
+        }
         self.label_layout = None;
         self.snapshot = text.into();
     }
+    fn migrate_transformer_connections(&mut self, wide_windings: bool, extended_primaries: bool) {
+        let mut moved = HashMap::<Point, Vec<Point>>::new();
+        let mut stationary = HashSet::new();
+        for (name, &center) in &self.positions {
+            let part = self.kinds[name];
+            let turns = self.turns(name);
+            let terminals = part.terminals(center, turns);
+            let Some((inputs, outputs)) = part.transformer_windings() else {
+                stationary.extend(terminals);
+                continue;
+            };
+            let mut old = Vec::new();
+            let primary_x = if !wide_windings && extended_primaries {
+                -3
+            } else {
+                -2
+            };
+            let half_span = if wide_windings { WINDING_HALF_SPAN } else { 1 };
+            let half_pitch = if wide_windings { 3 } else { 2 };
+            for (x, count) in [(primary_x, inputs), (2, outputs)] {
+                for y in winding_centers(count, half_pitch) {
+                    old.push((x, y - half_span));
+                    if x > 0 && part == Part::CenterTappedTransformer {
+                        old.push((x, y));
+                    }
+                    old.push((x, y + half_span));
+                }
+            }
+            for (offset, new) in old.into_iter().zip(terminals) {
+                let (x, y) = orient_offset(offset, turns);
+                let old = (center.0 + x, center.1 + y);
+                if old == new {
+                    stationary.insert(old);
+                } else {
+                    moved.entry(old).or_default().push(new);
+                }
+            }
+        }
+        if moved.is_empty() {
+            return;
+        }
+        // Move each shared wire vertex once. Split wires first when a pin was
+        // connected in the middle of a segment rather than at an endpoint.
+        let remap = |point| {
+            if stationary.contains(&point) {
+                return point;
+            }
+            moved
+                .get(&point)
+                .map_or(point, |destinations| destinations[0])
+        };
+        let mut wires = Vec::new();
+        for (a, b) in std::mem::take(&mut self.wires) {
+            let mut vertices = vec![a, b];
+            vertices.extend(moved.keys().copied().filter(|&p| on_wire(p, (a, b))));
+            vertices.sort_unstable();
+            vertices.dedup();
+            wires.extend(
+                vertices
+                    .windows(2)
+                    .map(|pair| (remap(pair[0]), remap(pair[1]))),
+            );
+        }
+        self.grounds.iter_mut().for_each(|p| *p = remap(*p));
+        self.powers.iter_mut().for_each(|p| *p = remap(*p));
+        self.power_voltages = std::mem::take(&mut self.power_voltages)
+            .into_iter()
+            .map(|(p, v)| (remap(p), v))
+            .collect();
+        self.power_turns = std::mem::take(&mut self.power_turns)
+            .into_iter()
+            .map(|(p, turns)| (remap(p), turns))
+            .collect();
+        for (&old, destinations) in &moved {
+            let junction = remap(old);
+            wires.extend(
+                destinations
+                    .iter()
+                    .filter(|&&p| p != junction)
+                    .map(|&p| (junction, p)),
+            );
+        }
+        self.wires = wires;
+        self.normalize();
+    }
+
     fn index_parts(&mut self, text: &str) {
         self.kinds = cards(text)
             .into_iter()
@@ -633,6 +1103,11 @@ impl Schematic {
     fn turns(&self, name: &str) -> u8 {
         self.rotations.get(name).copied().unwrap_or(0)
     }
+    #[cfg(test)]
+    pub(crate) fn grid_offset(&self, offset: egui::Vec2) -> egui::Vec2 {
+        self.pan + offset * 1.25_f32.powf(self.zoom_steps)
+    }
+
     pub(crate) fn zoom_percent(&self) -> f32 {
         100. * 1.25_f32.powf(self.zoom_steps)
     }
@@ -659,7 +1134,7 @@ impl Schematic {
                     for x in mid - 2..mid + 2 {
                         let d = vec2(x as f32 + 0.5 - mid as f32, y as f32 + 0.5 - mid as f32);
                         let alpha = ((1.9 - d.length()).clamp(0., 1.) * 255.).round() as u8;
-                        tile[(x, y)] = Color32::from_rgba_unmultiplied(182, 182, 182, alpha);
+                        tile[(x, y)] = Color32::from_rgba_unmultiplied(105, 123, 141, alpha);
                     }
                 }
                 self.grid_tiles.push(painter.ctx().load_texture(
@@ -690,10 +1165,11 @@ impl Schematic {
         draw(spacing, ((spacing - 5.) / 5.).clamp(0., 1.));
     }
 
-    fn rotate(&mut self) -> bool {
-        self.label_layout = None;
+    fn change_orientation(&mut self, edit: OrientationEdit) -> bool {
         if matches!(self.tool, Tool::Place(_) | Tool::Power) {
-            self.preview_turns = (self.preview_turns + 1) % 4;
+            if self.tool != Tool::Power || matches!(edit, OrientationEdit::Rotate) {
+                self.preview_turns = edit.apply(self.preview_turns);
+            }
             return false;
         }
         if self.tool == Tool::Move {
@@ -701,18 +1177,21 @@ impl Schematic {
                 for object in &self.selected {
                     if let Object::Part(name) = object {
                         let turns = self.rotations.entry(name.clone()).or_default();
-                        *turns = (*turns + 1) % 4;
-                    } else if let Object::Power(index) = *object {
+                        *turns = edit.apply(*turns);
+                    } else if let Object::Power(index) = *object
+                        && matches!(edit, OrientationEdit::Rotate)
+                    {
                         rotate_power(&mut self.power_turns, self.powers[index]);
                     }
                 }
             }
-            // Commit the rotation together with the placement.
+            // Commit the orientation change together with the placement.
             return false;
         }
         if !matches!(self.tool, Tool::Cursor | Tool::Select) {
             return false;
         }
+        self.label_layout = None;
         let mut moves = HashMap::new();
         let mut power_rotated = false;
         for obj in &self.selected {
@@ -720,9 +1199,11 @@ impl Schematic {
                 let center = self.positions[n];
                 let turns = self.rotations.entry(n.clone()).or_default();
                 let old = self.kinds[n].terminals(center, *turns);
-                *turns = (*turns + 1) % 4;
+                *turns = edit.apply(*turns);
                 moves.extend(old.into_iter().zip(self.kinds[n].terminals(center, *turns)));
-            } else if let Object::Power(index) = *obj {
+            } else if let Object::Power(index) = *obj
+                && matches!(edit, OrientationEdit::Rotate)
+            {
                 rotate_power(&mut self.power_turns, self.powers[index]);
                 power_rotated = true;
             }
@@ -747,17 +1228,46 @@ impl Schematic {
             .extend(moves.into_iter().filter(|(old, _)| fixed.contains(old)));
         true
     }
+    fn canvas_colors(&self) -> (Color32, Color32, Color32, Color32, Color32) {
+        if self.light_canvas {
+            (
+                Color32::WHITE,
+                Color32::from_rgb(0, 128, 35),
+                Color32::from_rgb(135, 15, 24),
+                Color32::from_rgb(0, 108, 116),
+                Color32::from_rgb(35, 111, 211),
+            )
+        } else {
+            (PAPER, WIRE, INK, LABEL, ACCENT)
+        }
+    }
+
+    fn toolbar_colors(&self) -> (Color32, Color32) {
+        if self.light_canvas {
+            (
+                Color32::from_rgb(88, 206, 117),
+                Color32::from_rgb(237, 129, 139),
+            )
+        } else {
+            (WIRE, INK)
+        }
+    }
+
     pub fn picker(&mut self, ui: &mut Ui) -> bool {
+        let (wire, ink) = self.toolbar_colors();
         let mut chosen = false;
         for (label, tool) in [("Wire", Tool::Wire), ("Ground", Tool::Ground)] {
             let (rect, response) =
                 ui.allocate_exact_size(crate::ui::TOOL_SIZE, egui::Sense::click());
-            let color = crate::ui::toolbar_surface(ui, &response, self.tool == tool);
+            crate::ui::toolbar_surface(ui, &response, self.tool == tool);
             let center = rect.center();
-            let pen = Stroke::new(1.5, color);
+            let pen = Stroke::new(1.7, if tool == Tool::Wire { wire } else { ink });
             let path = |points: &[(f32, f32)]| {
                 ui.painter().add(egui::Shape::line(
-                    points.iter().map(|&(x, y)| center + vec2(x, y)).collect(),
+                    points
+                        .iter()
+                        .map(|&(x, y)| center + vec2(x, y) * 1.2)
+                        .collect(),
                     pen,
                 ));
             };
@@ -766,7 +1276,7 @@ impl Schematic {
                     path(&[(-8., 6.), (-2., 6.), (-2., -5.), (8., -5.)]);
                     for (x, y) in [(-8., 6.), (8., -5.)] {
                         ui.painter()
-                            .circle_filled(center + vec2(x, y), 2., pen.color);
+                            .circle_filled(center + vec2(x, y) * 1.2, 2., pen.color);
                     }
                 }
                 Tool::Ground => {
@@ -794,7 +1304,8 @@ impl Schematic {
         let popup = egui::Popup::menu(&response);
         let color =
             crate::ui::toolbar_surface(ui, &response, popup.is_open() || self.tool == Tool::Power);
-        power_arrow(ui.painter(), rect.center() + vec2(-4., 8.), 0.9, 0, color);
+        let center = rect.center() - vec2(4., 0.);
+        power_arrow(ui.painter(), center + vec2(0., 10.), 1.1, 0, ink);
         icon_path(
             ui.painter(),
             rect.right_center() - vec2(7., 0.),
@@ -829,8 +1340,8 @@ impl Schematic {
             let (_, label, _) = part.spec();
             let (rect, response) =
                 ui.allocate_exact_size(crate::ui::TOOL_SIZE, egui::Sense::click_and_drag());
-            let color = crate::ui::toolbar_surface(ui, &response, self.tool == Tool::Place(part));
-            part.toolbar_icon(ui.painter(), rect.center(), color, self.american_resistor);
+            crate::ui::toolbar_surface(ui, &response, self.tool == Tool::Place(part));
+            part.toolbar_icon(ui.painter(), rect.center(), ink, self.american_resistor);
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
             let response = response.on_hover_text(format!("{label} · click or drag to place"));
             if response.clicked() || response.drag_started() {
@@ -856,26 +1367,26 @@ impl Schematic {
         let popup = egui::Popup::menu(&response);
         let color = crate::ui::toolbar_surface(ui, &response, popup.is_open());
         let center = rect.center() - vec2(4., 0.);
-        let pen = Stroke::new(1.5, color);
+        let pen = Stroke::new(1.7, ink);
         ui.painter().rect_stroke(
-            egui::Rect::from_center_size(center, vec2(13., 18.)),
+            egui::Rect::from_center_size(center, vec2(15., 22.)),
             2,
             pen,
             egui::StrokeKind::Middle,
         );
         ui.painter()
-            .circle_filled(center + vec2(-2.5, -5.), 1.25, color);
+            .circle_filled(center + vec2(-3., -6.), 1.5, ink);
         for side in [-1., 1.] {
-            for y in [-5.5, 0., 5.5] {
+            for y in [-6.5, 0., 6.5] {
                 icon_path(
                     ui.painter(),
                     center,
                     pen,
                     &[
-                        (side * 6.5, y - 1.3),
-                        (side * 9.5, y - 1.3),
-                        (side * 9.5, y + 1.3),
-                        (side * 6.5, y + 1.3),
+                        (side * 7.5, y - 1.3),
+                        (side * 11., y - 1.3),
+                        (side * 11., y + 1.3),
+                        (side * 7.5, y + 1.3),
                     ],
                 );
             }
@@ -900,7 +1411,12 @@ impl Schematic {
                                 .sense(egui::Sense::click_and_drag()),
                         );
                         if r.clicked() || r.drag_started() {
-                            self.begin_placement(part, r.drag_started());
+                            if let Part::CustomTransformer { inputs, outputs } = part {
+                                self.cancel();
+                                self.transformer_setup = Some((inputs, outputs));
+                            } else {
+                                self.begin_placement(part, r.drag_started());
+                            }
                             chosen = true;
                             ui.close();
                         }
@@ -927,15 +1443,16 @@ impl Schematic {
             &response,
             popup.is_open() || variants.iter().any(|&part| self.tool == Tool::Place(part)),
         );
+        let (_, ink) = self.toolbar_colors();
         let icon_center = rect.center() - vec2(4., 0.);
         draw(
             ui.painter(),
             icon_center,
             (variants[0], ""),
             0,
-            0.36,
+            0.47,
             self.american_resistor,
-            color,
+            (ink, Color32::TRANSPARENT),
         );
         icon_path(
             ui.painter(),
@@ -952,14 +1469,15 @@ impl Schematic {
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
                 let color =
                     crate::ui::toolbar_surface(ui, &response, self.tool == Tool::Place(part));
+                let center = rect.left_center() + vec2(17., 0.);
                 draw(
                     ui.painter(),
-                    rect.left_center() + vec2(17., 0.),
+                    center,
                     (part, ""),
                     0,
-                    0.42,
+                    0.47,
                     self.american_resistor,
-                    color,
+                    (ink, Color32::TRANSPARENT),
                 );
                 ui.painter().text(
                     rect.left_center() + vec2(35., 0.),
@@ -986,7 +1504,10 @@ impl Schematic {
 
     fn accepts_tool_shortcuts(&self, ui: &Ui) -> bool {
         self.editing.is_none()
+            && self.transformer_setup.is_none()
             && self.editing_power.is_none()
+            && self.editing_comment.is_none()
+            && self.new_comment.is_none()
             && !ui.ctx().text_edit_focused()
             && !egui::Popup::is_any_open(ui.ctx())
     }
@@ -1007,6 +1528,7 @@ impl Schematic {
                 (Key::M, Modifiers::NONE, Tool::Move),
                 (Key::C, Modifiers::CTRL, Tool::Copy),
                 (Key::W, Modifiers::NONE, Tool::Wire),
+                (Key::T, Modifiers::NONE, Tool::Comment),
                 (Key::G, Modifiers::NONE, Tool::Ground),
                 (Key::P, Modifiers::NONE, Tool::Power),
                 (Key::V, Modifiers::NONE, Tool::Place(Part::Voltage)),
@@ -1031,8 +1553,14 @@ impl Schematic {
         Some(mode)
     }
 
+    pub(crate) fn writing_comment(&self) -> bool {
+        self.new_comment.is_some()
+    }
+
     pub fn cancel(&mut self) {
+        self.voltage_drag = None;
         self.tool = Tool::Cursor;
+        self.transformer_setup = None;
         if self.copy_anchor.take().is_some() {
             self.selected.clear();
         }
@@ -1098,6 +1626,8 @@ impl Schematic {
                 }
             }
         }
+        self.labels
+            .retain(|name, _| self.positions.contains_key(name));
         self.label_layout = None;
         self.snapshot = text.into();
     }
@@ -1177,12 +1707,65 @@ impl Schematic {
             .collect()
     }
 
+    fn label_bounds(&self, name: &str) -> Option<egui::Rect> {
+        let bounds = *self.label_layout.as_ref()?.get(name)?;
+        match self.labels.get(name) {
+            Some(LabelPlacement::Hidden) => None,
+            Some(LabelPlacement::Offset(x, y)) => Some(egui::Rect::from_min_size(
+                world_position(self.positions[name]) + vec2(*x, *y),
+                bounds.size(),
+            )),
+            None => Some(self.drag_origin.as_ref().map_or(bounds, |origin| {
+                bounds.translate(label_move_offset(name, &self.positions, origin))
+            })),
+        }
+    }
+
+    fn translate_moved_labels(&mut self, origin: &Geometry) {
+        if let Some(layout) = &mut self.label_layout {
+            for (name, bounds) in layout {
+                *bounds = bounds.translate(label_move_offset(name, &self.positions, origin));
+            }
+        }
+    }
+
+    fn rename_label(&mut self, original: &str, reference: &str) {
+        if original != reference {
+            if let Some(placement @ LabelPlacement::Offset(..)) = self.labels.remove(original) {
+                self.labels.insert(reference.to_owned(), placement);
+            }
+            if self.selected.remove(&Object::Label(original.to_owned())) {
+                self.selected.insert(Object::Label(reference.to_owned()));
+            }
+        }
+    }
+
     fn move_selection(&mut self, delta: Point) {
-        self.label_layout = None;
         let shift = |p: &mut Point| {
             p.0 += delta.0;
             p.1 += delta.1;
         };
+        for (i, comment) in self.comments.iter_mut().enumerate() {
+            if self.selected.contains(&Object::Comment(i)) {
+                shift(&mut comment.position);
+            }
+        }
+        if delta != (0, 0) {
+            for object in &self.selected {
+                if let Object::Label(name) = object
+                    && !self.selected.contains(&Object::Part(name.clone()))
+                    && let Some(bounds) = self.label_bounds(name)
+                {
+                    let offset = bounds.min - world_position(self.positions[name])
+                        + world_position(delta).to_vec2();
+                    self.labels
+                        .insert(name.clone(), LabelPlacement::Offset(offset.x, offset.y));
+                }
+            }
+        }
+        if self.selected.iter().all(Object::is_annotation) {
+            return;
+        }
         let mut moving = HashSet::new();
         let mut fixed = HashSet::new();
         for (name, pos) in &mut self.positions {
@@ -1307,7 +1890,12 @@ impl Schematic {
         self.positions
             .iter()
             .find(|(n, p)| {
-                if self.kinds[*n].layout().len() > 2 {
+                if self.kinds[*n].transformer_windings().is_some() {
+                    let center = egui::pos2(p.0 as f32 * GRID, p.1 as f32 * GRID);
+                    return symbol_bounds(self.kinds[*n], center, self.turns(n), 1.)
+                        .contains(egui::pos2(q.0 as f32 * GRID, q.1 as f32 * GRID));
+                }
+                if self.kinds[*n].pin_count() > 2 {
                     return (q.0 - p.0).abs() <= 1 && (q.1 - p.1).abs() <= 1;
                 }
                 if matches!(self.kinds[*n], Part::Voltage | Part::Current)
@@ -1345,6 +1933,22 @@ impl Schematic {
         if targets.is_empty() {
             return false;
         }
+        let mut index = 0;
+        self.comments.retain(|_| {
+            let keep = !targets.contains(&Object::Comment(index));
+            index += 1;
+            keep
+        });
+        for object in &targets {
+            if let Object::Label(name) = object {
+                self.labels.insert(name.clone(), LabelPlacement::Hidden);
+            }
+        }
+        if targets.iter().all(Object::is_annotation) {
+            self.selected.clear();
+            self.gesture = None;
+            return true;
+        }
         let lines: HashSet<_> = cards(text)
             .iter()
             .filter(|c| targets.contains(&Object::Part(c.name.into())))
@@ -1364,6 +1968,7 @@ impl Schematic {
         self.positions
             .retain(|n, _| !targets.contains(&Object::Part(n.clone())));
         self.rotations.retain(|n, _| self.positions.contains_key(n));
+        self.labels.retain(|n, _| self.positions.contains_key(n));
         let mut i = 0;
         self.grounds.retain(|_| {
             let keep = !targets.contains(&Object::Ground(i));
@@ -1427,7 +2032,7 @@ impl Schematic {
                     break name;
                 }
             };
-            let nodes = vec!["?"; card.part.layout().len()].join(" ");
+            let nodes = vec!["?"; card.part.pin_count()].join(" ");
             new_cards.push_str(&format!("{name} {nodes} {}\n", card.value));
             for line in lines[card.line + 1..]
                 .iter()
@@ -1439,6 +2044,9 @@ impl Schematic {
             self.positions
                 .insert(name.clone(), offset(self.positions[card.name]));
             self.rotations.insert(name.clone(), self.turns(card.name));
+            if let Some(&placement) = self.labels.get(card.name) {
+                self.labels.insert(name.clone(), placement);
+            }
             self.kinds.insert(name, card.part);
         }
         if !new_cards.is_empty() {
@@ -1469,7 +2077,12 @@ impl Schematic {
                         }
                     }
                 }
-                Object::Part(_) => {}
+                Object::Comment(index) => {
+                    let mut comment = self.comments[index].clone();
+                    comment.position = offset(comment.position);
+                    self.comments.push(comment);
+                }
+                Object::Part(_) | Object::Label(_) => {}
             }
         }
         self.copy_anchor = None;
@@ -1661,21 +2274,154 @@ impl Schematic {
         &mut self,
         ui: &mut Ui,
         text: &mut String,
-        probe: Option<&mut Option<(String, bool)>>,
+        mut probe: Option<&mut Option<(String, bool)>>,
+        current_hover: Option<&str>,
     ) -> bool {
         if self.snapshot != *text {
             self.import(text);
         }
         let mut changed = false;
-        if !ui.ctx().text_edit_focused()
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R))
-            && self.rotate()
+        let mut annotations_only = false;
+        let mut keep_label_layout = false;
+        if self.accepts_tool_shortcuts(ui)
+            && !ui.ctx().memory(|memory| memory.top_modal_layer().is_some())
         {
-            changed = true;
+            let edit = ui.input_mut(|input| {
+                use egui::{Key, Modifiers};
+                [
+                    (
+                        Modifiers::CTRL | Modifiers::SHIFT,
+                        Key::E,
+                        OrientationEdit::MirrorVertical,
+                    ),
+                    (Modifiers::CTRL, Key::E, OrientationEdit::MirrorHorizontal),
+                    (Modifiers::CTRL, Key::R, OrientationEdit::Rotate),
+                ]
+                .into_iter()
+                .find_map(|(modifiers, key, edit)| {
+                    input.consume_key(modifiers, key).then_some(edit)
+                })
+            });
+            if let Some(edit) = edit {
+                changed = self.change_orientation(edit);
+            }
         }
         {
             let (r, p) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
-            self.viewport = r.rect.size();
+            let (paper, wire_color, ink, label, accent) = self.canvas_colors();
+            let comment_color = if self.light_canvas {
+                Color32::from_rgb(24, 116, 67)
+            } else {
+                Color32::from_rgb(125, 211, 153)
+            };
+            let comment_galley = |comment: &Comment, scale| {
+                p.layout_no_wrap(
+                    comment.text.clone(),
+                    FontId::proportional(COMMENT_FONT_SIZE * scale),
+                    comment_color,
+                )
+            };
+            let parts = cards(text);
+            // Only geometry edits can reflow existing labels. A floating
+            // component finds room for its own label after these are placed.
+            let world = world_position;
+            if self.label_layout.is_none() {
+                let mut occupied: Vec<_> = parts
+                    .iter()
+                    .map(|c| {
+                        symbol_bounds(
+                            c.part,
+                            world(self.positions[c.name]),
+                            self.turns(c.name),
+                            1.,
+                        )
+                    })
+                    .collect();
+                let wires: Vec<_> = self
+                    .wires
+                    .iter()
+                    .map(|&(a, b)| [world(a), world(b)])
+                    .collect();
+                let mut layout = HashMap::new();
+                let mut automatic = Vec::new();
+                for c in &parts {
+                    let center = world(self.positions[c.name]);
+                    let placement = self.labels.get(c.name);
+                    if placement == Some(&LabelPlacement::Hidden) {
+                        continue;
+                    }
+                    let (name, value) = label_text(&p, c, 1., label);
+                    let size = label_size(&name, &value);
+                    if let Some(&LabelPlacement::Offset(x, y)) = placement {
+                        let bounds = egui::Rect::from_min_size(center + vec2(x, y), size);
+                        occupied.push(bounds.expand(2.));
+                        layout.insert(c.name.to_owned(), bounds);
+                    } else {
+                        automatic.push((c.name, center, size));
+                    }
+                }
+                for (name, center, size) in automatic {
+                    let bounds = place_label(
+                        center,
+                        1.,
+                        size,
+                        LABEL_CLEARANCE,
+                        &wires,
+                        &mut occupied,
+                        egui::Rect::EVERYTHING,
+                    )
+                    .unwrap();
+                    layout.insert(name.to_owned(), bounds);
+                }
+                self.label_layout = Some(layout);
+            }
+            let viewport = r.rect.size();
+            let resized = self.viewport != egui::Vec2::ZERO && viewport != self.viewport;
+            self.viewport = viewport;
+            let fit = std::mem::take(&mut self.fit_pending);
+            let center = std::mem::take(&mut self.center_pending);
+            if fit || center || resized {
+                let mut bounds = egui::Rect::NOTHING;
+                for c in &parts {
+                    bounds = bounds.union(symbol_bounds(
+                        c.part,
+                        world(self.positions[c.name]),
+                        self.turns(c.name),
+                        1.,
+                    ));
+                }
+                for label in parts.iter().filter_map(|c| self.label_bounds(c.name)) {
+                    bounds = bounds.union(label);
+                }
+                for &(a, b) in &self.wires {
+                    bounds.extend_with(world(a));
+                    bounds.extend_with(world(b));
+                }
+                for &point in self.grounds.iter().chain(&self.powers) {
+                    bounds =
+                        bounds.union(egui::Rect::from_center_size(world(point), vec2(42., 76.)));
+                }
+                for comment in &self.comments {
+                    bounds = bounds.union(egui::Rect::from_min_size(
+                        world(comment.position),
+                        comment_galley(comment, 1.).size(),
+                    ));
+                }
+                if bounds.is_finite() {
+                    let available = (viewport - vec2(40., 40.)).max(vec2(1., 1.));
+                    let size = bounds.size().max(vec2(1., 1.));
+                    let scale_limit = if fit {
+                        1.25_f32.powf(7.)
+                    } else {
+                        1.25_f32.powf(self.zoom_steps)
+                    };
+                    let scale = (available.x / size.x)
+                        .min(available.y / size.y)
+                        .min(scale_limit);
+                    self.zoom_steps = scale.log(1.25);
+                    self.pan = viewport * 0.5 - bounds.center().to_vec2() * scale;
+                }
+            }
             if let Some(pos) = r.hover_pos() {
                 let factor = ui.input(crate::ui::canvas_zoom_factor);
                 if factor != 1. {
@@ -1693,7 +2439,29 @@ impl Schematic {
                 (d.x as i32, d.y as i32)
             };
             let rect = r.rect.intersect(p.clip_rect());
-            p.rect_filled(rect, 0, PAPER);
+            let show_labels = LABEL_VALUE_SIZE * scale * p.ctx().pixels_per_point() >= 6.;
+            let label_bounds: Vec<_> = if show_labels {
+                parts
+                    .iter()
+                    .filter_map(|c| {
+                        let bounds = self.label_bounds(c.name)?;
+                        let bounds = egui::Rect::from_min_max(
+                            origin + bounds.min.to_vec2() * scale,
+                            origin + bounds.max.to_vec2() * scale,
+                        );
+                        bounds.intersects(rect).then_some((c, bounds))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let label_at = |pos: Pos2| {
+                label_bounds
+                    .iter()
+                    .rfind(|(_, bounds)| bounds.expand(2.).contains(pos))
+                    .map(|(card, _)| card.name)
+            };
+            p.rect_filled(rect, 0, paper);
             self.draw_grid(&p, rect, origin, GRID * scale);
             let mouse = ui.input(|i| i.pointer.interact_pos());
             let point = mouse.map(snap).unwrap_or_default();
@@ -1713,7 +2481,32 @@ impl Schematic {
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(i, _)| i)
             };
-            if r.hovered()
+            let comments: Vec<_> = self
+                .comments
+                .iter()
+                .map(|comment| {
+                    let galley = comment_galley(comment, scale);
+                    let bounds = egui::Rect::from_min_size(screen(comment.position), galley.size());
+                    (bounds, galley)
+                })
+                .collect();
+            let comment_at = |pos: Pos2| {
+                comments
+                    .iter()
+                    .rposition(|(bounds, _)| bounds.expand(3.).contains(pos))
+            };
+            let hit_at = |schematic: &Self, pos: Pos2| {
+                comment_at(pos)
+                    .map(Object::Comment)
+                    .or_else(|| {
+                        label_at(pos)
+                            .filter(|_| schematic.tool != Tool::Copy)
+                            .map(|name| Object::Label(name.into()))
+                    })
+                    .or_else(|| schematic.symbol_at(snap(pos)))
+                    .or_else(|| wire_at(pos, &schematic.wires).map(Object::Wire))
+            };
+            let keyboard_delete = if r.hovered()
                 && self.accepts_tool_shortcuts(ui)
                 && self.drag_origin.is_none()
                 && self.copy_anchor.is_none()
@@ -1723,21 +2516,20 @@ impl Schematic {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                         || i.consume_key(egui::Modifiers::CTRL, egui::Key::X)
                         || consume_clipboard_event(i, egui::Event::Cut)
-                })
-            {
-                let hovered = r.hover_pos().and_then(|pos| {
-                    self.symbol_at(snap(pos))
-                        .or_else(|| wire_at(pos, &self.wires).map(Object::Wire))
-                });
-                if self.delete_objects(text, hovered) {
-                    ui.ctx().request_repaint();
-                    return true;
+                }) {
+                let hovered = r.hover_pos().and_then(|pos| hit_at(self, pos));
+                if hovered.is_some() || !self.selected.is_empty() {
+                    Some(hovered)
+                } else {
+                    self.cancel();
+                    self.tool = Tool::Erase;
+                    None
                 }
-                self.cancel();
-                self.tool = Tool::Erase;
-            }
+            } else {
+                None
+            };
             let color = |selected| {
-                if selected { ACCENT } else { WIRE }
+                if selected { accent } else { wire_color }
             };
             // Use the same path rendering as component leads. egui pixel-snaps
             // line segments independently, which shifts them off the pin center.
@@ -1762,57 +2554,10 @@ impl Schematic {
             for &(a, b) in &self.drag_leads {
                 p.line(
                     vec![screen(a), screen(b)],
-                    Stroke::new(SCHEMATIC_STROKE, WIRE),
+                    Stroke::new(SCHEMATIC_STROKE, wire_color),
                 );
             }
-            let parts = cards(text);
-            // Only geometry edits can reflow existing labels. A floating
-            // component finds room for its own label after these are placed.
-            let preview_layout = self.drag_origin.is_some() || self.start.is_some();
             let placing = inside && matches!(self.tool, Tool::Place(_));
-            let world = |(x, y): Point| egui::pos2(x as f32 * GRID, y as f32 * GRID);
-            let project = |r: egui::Rect| {
-                egui::Rect::from_min_max(
-                    origin + r.min.to_vec2() * scale,
-                    origin + r.max.to_vec2() * scale,
-                )
-            };
-            if !preview_layout && self.label_layout.is_none() {
-                let mut occupied: Vec<_> = parts
-                    .iter()
-                    .map(|c| {
-                        symbol_bounds(
-                            c.part,
-                            world(self.positions[c.name]),
-                            self.turns(c.name),
-                            1.,
-                        )
-                    })
-                    .collect();
-                let wires: Vec<_> = self
-                    .wires
-                    .iter()
-                    .map(|&(a, b)| [world(a), world(b)])
-                    .collect();
-                self.label_layout = Some(
-                    parts
-                        .iter()
-                        .map(|c| {
-                            let (name, value) = label_text(&p, c, 1.);
-                            place_label(
-                                world(self.positions[c.name]),
-                                1.,
-                                label_size(&name, &value),
-                                12.,
-                                &wires,
-                                &mut occupied,
-                                egui::Rect::EVERYTHING,
-                            )
-                            .unwrap()
-                        })
-                        .collect(),
-                );
-            }
             let mut obstacles: Vec<_> = parts
                 .iter()
                 .map(|c| {
@@ -1849,13 +2594,12 @@ impl Schematic {
                     *degree.entry(pin).or_default() += 1;
                 }
             }
-            let mut hovered_label = None;
-            for (index, c) in parts.into_iter().enumerate() {
+            for (index, c) in parts.iter().enumerate() {
                 let pos = self.positions[c.name];
                 let color = if self.selected.contains(&Object::Part(c.name.into())) {
-                    ACCENT
+                    accent
                 } else {
-                    INK
+                    ink
                 };
                 if obstacles[index].intersects(rect) {
                     draw(
@@ -1865,32 +2609,28 @@ impl Schematic {
                         self.turns(c.name),
                         scale,
                         self.american_resistor,
-                        color,
+                        (color, paper),
                     );
                     for pin in c.part.terminals(pos, self.turns(c.name)) {
                         if degree[&pin] == 1 {
-                            draw_open_pin(&p, screen(pin), scale, color);
+                            draw_open_pin(&p, screen(pin), scale, color, paper);
                         }
                     }
                 }
-                let bounds = if preview_layout {
-                    draw_labels(&p, screen(pos), &c, scale, &segments, &mut obstacles)
+            }
+            for &(c, bounds) in &label_bounds {
+                let color = if self.selected.contains(&Object::Label(c.name.into())) {
+                    accent
                 } else {
-                    let bounds = project(self.label_layout.as_ref().unwrap()[index]);
-                    if placing || self.fit_pending || self.operating_point.is_some() {
-                        obstacles.push(bounds);
-                    }
-                    if !bounds.intersects(rect) || 11. * scale * p.ctx().pixels_per_point() < 6. {
-                        continue;
-                    }
-                    let (name, value) = label_text(&p, &c, scale);
-                    paint_label(&p, bounds.min, name, value);
-                    bounds
+                    label
                 };
-                if r.hover_pos().is_some_and(|pos| bounds.contains(pos)) {
-                    hovered_label = Some(c.name.to_owned());
+                let (name, value) = label_text(&p, c, scale, color);
+                paint_label(&p, bounds.min, name, value);
+                if placing || self.operating_point.is_some() {
+                    obstacles.push(bounds);
                 }
             }
+            let hovered_label = r.hover_pos().and_then(label_at);
             let ground = |q, col| {
                 let z = screen(q);
                 let pen = Stroke::new(SCHEMATIC_STROKE, col);
@@ -1910,9 +2650,9 @@ impl Schematic {
                     ground(
                         q,
                         if self.selected.contains(&Object::Ground(i)) {
-                            ACCENT
+                            accent
                         } else {
-                            INK
+                            ink
                         },
                     );
                 }
@@ -1948,9 +2688,9 @@ impl Schematic {
                         self.power_voltages.get(&q).copied(),
                         self.power_turns.get(&q).copied().unwrap_or(0),
                         if self.selected.contains(&Object::Power(i)) {
-                            ACCENT
+                            accent
                         } else {
-                            INK
+                            ink
                         },
                     );
                     if r.hover_pos()
@@ -1960,97 +2700,177 @@ impl Schematic {
                     }
                 }
             }
-            if std::mem::take(&mut self.fit_pending) {
-                let mut bounds = egui::Rect::NOTHING;
-                for rect in &obstacles {
-                    bounds = bounds.union(*rect);
-                }
-                for &[a, b] in &segments {
-                    bounds.extend_with(a);
-                    bounds.extend_with(b);
-                }
-                for &q in self.grounds.iter().chain(&self.powers) {
-                    bounds = bounds.union(egui::Rect::from_center_size(
-                        screen(q),
-                        vec2(42., 76.) * scale,
-                    ));
-                }
-                if bounds.is_finite() {
-                    let available = (self.viewport - vec2(40., 40.)).max(vec2(1., 1.));
-                    let size = bounds.size().max(vec2(1., 1.));
-                    let factor = (available.x / size.x)
-                        .min(available.y / size.y)
-                        .min(1.25_f32.powf(7.) / scale);
-                    self.pan = self.viewport * 0.5 - (bounds.center() - origin) * factor;
-                    self.zoom_steps += factor.log(1.25);
-                    ui.ctx().request_repaint();
-                }
-            }
             for (&q, &n) in &degree {
                 if n >= 3 && rect.expand(4.).contains(screen(q)) {
-                    p.circle_filled(screen(q), 4., WIRE);
+                    p.circle_filled(screen(q), 4., wire_color);
                 }
             }
-            let mut probe_clicked = false;
-            if (probe.is_some() || self.operating_point.is_some())
-                && self.tool == Tool::Cursor
-                && self.editing.is_none()
-                && self.editing_power.is_none()
-                && !r.dragged()
-                && !r.secondary_clicked()
-                && let Some(pos) = r.hover_pos()
-            {
-                let pin = if self.operating_point.is_some() && screen(point).distance(pos) <= 6. {
-                    cards(text)
-                        .into_iter()
+            for (index, (bounds, galley)) in comments.iter().enumerate() {
+                if bounds.intersects(rect) {
+                    if self.selected.contains(&Object::Comment(index)) {
+                        p.rect_stroke(
+                            bounds.expand(2.),
+                            2,
+                            Stroke::new(1., accent),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    p.galley(bounds.min, galley.clone(), comment_color);
+                }
+            }
+            let voltage_at = |schematic: &Self, pos: Pos2| {
+                let point = snap(pos);
+                let pin = if screen(point).distance(pos) <= 6. {
+                    parts
+                        .iter()
                         .find_map(|card| {
                             card.part
-                                .terminals(self.positions[card.name], self.turns(card.name))
+                                .terminals(
+                                    schematic.positions[card.name],
+                                    schematic.turns(card.name),
+                                )
                                 .into_iter()
-                                .zip(card.nodes)
-                                .find_map(|(pin, node)| (pin == point).then_some(node))
+                                .zip(card.nodes.iter().copied())
+                                .find_map(|(pin, node)| {
+                                    (pin == point && node != "?").then_some(node)
+                                })
                         })
-                        .or_else(|| self.grounds.contains(&point).then_some("0"))
-                        .or_else(|| self.power_node(point, text))
+                        .or_else(|| schematic.grounds.contains(&point).then_some("0"))
+                        .or_else(|| schematic.power_node(point, text))
                 } else {
                     None
                 };
-                let wire = wire_at(pos, &self.wires);
-                let target = if pin.is_some() || wire.is_some() {
-                    probe_cursor(ui, pos, false);
-                    if r.clicked() {
-                        let node =
-                            pin.or_else(|| wire.and_then(|index| self.wire_node(index, text)));
-                        node.map(|node| (format!("V({node})"), point))
+                pin.or_else(|| {
+                    wire_at(pos, &schematic.wires)
+                        .and_then(|index| schematic.wire_node(index, text))
+                })
+            };
+            let can_probe = self.new_comment.is_none()
+                && (probe.is_some() || self.operating_point.is_some())
+                && self.tool == Tool::Cursor
+                && self.editing.is_none()
+                && self.editing_power.is_none()
+                && !r.secondary_clicked();
+            let target_node = mouse
+                .filter(|&pos| {
+                    can_probe
+                        && rect.contains(pos)
+                        && comment_at(pos).is_none()
+                        && label_at(pos).is_none()
+                })
+                .and_then(|pos| voltage_at(self, pos));
+            if can_probe
+                && r.is_pointer_button_down_on()
+                && ui.input(|i| i.pointer.primary_pressed())
+            {
+                self.voltage_drag = target_node.map(str::to_owned);
+            }
+            let captured_voltage_drag = can_probe && self.voltage_drag.is_some() && !r.clicked();
+            let mut differential = None;
+            if captured_voltage_drag {
+                let start = self.voltage_drag.as_deref().unwrap();
+                let end = target_node.filter(|node| !node.eq_ignore_ascii_case(start));
+                if r.drag_stopped_by(egui::PointerButton::Primary) {
+                    differential = end.map(|end| (format!("V({start},{end})"), point));
+                } else if ui.input(|i| i.pointer.primary_down())
+                    && let Some(pos) = mouse.filter(|&pos| rect.contains(pos))
+                {
+                    let color = if end.is_some() {
+                        Color32::from_rgb(100, 205, 133)
                     } else {
-                        None
-                    }
-                } else if let Some(name) = hovered_label.as_ref().or_else(|| {
+                        Color32::GRAY
+                    };
+                    probe_cursor(ui, pos, None, self.light_canvas, Some(color));
+                }
+            }
+            if !can_probe || !ui.input(|i| i.pointer.primary_down()) {
+                self.voltage_drag = None;
+            }
+
+            if let Some((component, reversed)) =
+                current_hover.and_then(crate::waveform::current_trace)
+                && let Some((name, &center)) = self
+                    .positions
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(component))
+            {
+                let part = self.kinds[name];
+                let orientation = self.turns(name);
+                let pin = part.terminals(center, orientation)[part.current_probe_terminal()];
+                let inward = part.current_probe_direction(orientation);
+                let sideways = vec2(-inward.y, inward.x);
+                let anchor = screen(pin) + inward * (8. * scale) + sideways * (8. * scale).max(7.);
+                let painter = p.with_clip_rect(rect);
+                let colors = crate::ui::CURRENT_ARROW_COLORS;
+                let direction = if reversed { -inward } else { inward };
+                crate::ui::paint_play_triangle(
+                    &painter, anchor, direction, 1.65, 1.25, 12., colors,
+                );
+            }
+
+            let mut probe_clicked = false;
+            let mut target = differential;
+            if can_probe
+                && !captured_voltage_drag
+                && mouse.and_then(comment_at).is_none()
+                && !r.dragged()
+                && let Some(pos) = r.hover_pos()
+            {
+                target = if let Some(node) = target_node {
+                    probe_cursor(ui, pos, None, self.light_canvas, None);
+                    r.clicked().then(|| (format!("V({node})"), point))
+                } else if let Some(name) = hovered_label.or_else(|| {
                     self.positions
                         .iter()
                         .find(|&(_, &center)| {
                             egui::Rect::from_center_size(screen(center), vec2(34., 34.) * scale)
                                 .contains(pos)
                         })
-                        .map(|(name, _)| name)
+                        .map(|(name, _)| name.as_str())
                 }) {
-                    probe_cursor(ui, pos, true);
-                    r.clicked()
-                        .then(|| (format!("I({name})"), self.positions[name]))
+                    let orientation = self.turns(name);
+                    let direction = self.kinds[name].current_probe_direction(orientation);
+                    let reverse = ui.input(|input| input.modifiers.ctrl);
+                    let direction = if reverse { -direction } else { direction };
+                    probe_cursor(ui, pos, Some(direction), self.light_canvas, None);
+                    r.clicked().then(|| {
+                        let sign = if reverse { "-" } else { "" };
+                        (format!("{sign}I({name})"), self.positions[name])
+                    })
                 } else {
                     None
                 };
-                if let Some((signal, anchor)) = target {
-                    probe_clicked = true;
-                    if let Some(op) = &mut self.operating_point {
-                        let key = signal.to_ascii_lowercase();
-                        if op.values.contains_key(&key) {
-                            op.probes.insert(key, anchor);
-                            ui.ctx().request_repaint();
-                        }
-                    } else if let Some(probe) = probe {
-                        *probe = Some((signal, r.double_clicked() || r.triple_clicked()));
+            }
+            if let Some((signal, anchor)) = target {
+                probe_clicked = true;
+                if let Some(op) = &mut self.operating_point {
+                    let key = signal.to_ascii_lowercase();
+                    if let Some((positive, negative)) = crate::waveform::differential_nodes(&key)
+                        && let (Some(a), Some(b)) = (
+                            op.values.get(&format!("v({positive})")),
+                            op.values.get(&format!("v({negative})")),
+                        )
+                    {
+                        op.values.insert(key.clone(), a - b);
                     }
+                    if let Some((component, reversed)) = crate::waveform::current_trace(&key) {
+                        let positive = format!("i({component})");
+                        let negative = format!("-i({component})");
+                        if reversed {
+                            if let Some(&value) = op.values.get(&positive) {
+                                op.values.insert(negative.clone(), -value);
+                            }
+                            op.probes.remove(&positive);
+                        } else {
+                            op.probes.remove(&negative);
+                        }
+                    }
+                    if op.values.contains_key(&key) {
+                        op.probes.insert(key, anchor);
+                        ui.ctx().request_repaint();
+                    }
+                } else if let Some(probe) = probe.as_deref_mut() {
+                    *probe = Some((signal, r.double_clicked() || r.triple_clicked()));
                 }
             }
 
@@ -2060,9 +2880,10 @@ impl Schematic {
                     for card in cards(text) {
                         let center = self.positions[card.name];
                         if op.display.currents {
-                            annotations
-                                .entry(format!("i({})", card.name.to_ascii_lowercase()))
-                                .or_insert(center);
+                            let name = format!("i({})", card.name.to_ascii_lowercase());
+                            if !annotations.contains_key(&format!("-{name}")) {
+                                annotations.entry(name).or_insert(center);
+                            }
                         }
                         if op.display.voltages {
                             for (pin, node) in card
@@ -2090,6 +2911,7 @@ impl Schematic {
                         }
                     }
                 }
+                let mut hovered_signal = None;
                 for (signal, anchor) in annotations {
                     let Some(&value) = op.values.get(&signal).filter(|v| v.is_finite()) else {
                         continue;
@@ -2098,8 +2920,11 @@ impl Schematic {
                     if !rect.expand(30.).contains(center) {
                         continue;
                     }
-                    let text = format_operating_value(value, signal.starts_with("i("));
-                    let galley = p.layout_no_wrap(text, FontId::proportional(17.), ACCENT);
+                    let text = format_operating_value(
+                        value,
+                        crate::waveform::current_trace(&signal).is_some(),
+                    );
+                    let galley = p.layout_no_wrap(text, FontId::proportional(22.), accent);
                     let Some(bounds) = place_label(
                         center,
                         scale,
@@ -2111,20 +2936,109 @@ impl Schematic {
                     ) else {
                         continue;
                     };
-                    p.galley(bounds.min, galley, ACCENT);
+                    if r.hover_pos().is_some_and(|pos| bounds.contains(pos)) {
+                        hovered_signal = Some(signal);
+                    }
+                    p.galley(bounds.min, galley, accent);
                 }
+                if let Some(signal) = hovered_signal {
+                    let painter = p.with_clip_rect(rect);
+                    if let Some((component, _)) = crate::waveform::current_trace(&signal) {
+                        if let Some(card) = parts
+                            .iter()
+                            .find(|card| card.name.eq_ignore_ascii_case(component))
+                        {
+                            draw(
+                                &painter,
+                                screen(self.positions[card.name]),
+                                (card.part, card.value),
+                                self.turns(card.name),
+                                scale,
+                                self.american_resistor,
+                                (accent, paper),
+                            );
+                        }
+                    } else if let Some(nodes) = signal
+                        .strip_prefix("v(")
+                        .and_then(|signal| signal.strip_suffix(')'))
+                    {
+                        let matches_node = |node: &str| {
+                            nodes.split(',').any(|part| part.eq_ignore_ascii_case(node))
+                        };
+                        let mut pins: HashSet<_> = parts
+                            .iter()
+                            .flat_map(|card| {
+                                card.part
+                                    .terminals(self.positions[card.name], self.turns(card.name))
+                                    .into_iter()
+                                    .zip(card.nodes.iter().copied())
+                            })
+                            .filter_map(|(pin, node)| matches_node(node).then_some(pin))
+                            .collect();
+                        pins.extend(self.powers.iter().copied().filter(|&point| {
+                            self.power_node(point, text).is_some_and(matches_node)
+                        }));
+                        if matches_node("0") {
+                            pins.extend(self.grounds.iter().copied());
+                        }
+                        let mut remaining: Vec<_> = self.wires.iter().copied().collect();
+                        // Junctions split wire segments at their shared endpoints.
+                        // Seed with terminal positions to handle pins on imported segments too.
+                        loop {
+                            let mut found = false;
+                            remaining.retain(|&(a, b)| {
+                                if pins.contains(&a)
+                                    || pins.contains(&b)
+                                    || pins.iter().any(|&pin| on_wire(pin, (a, b)))
+                                {
+                                    pins.extend([a, b]);
+                                    if egui::Rect::from_two_pos(screen(a), screen(b))
+                                        .intersects(rect)
+                                    {
+                                        painter.line(
+                                            vec![screen(a), screen(b)],
+                                            Stroke::new(SCHEMATIC_STROKE + 1.5, accent),
+                                        );
+                                    }
+                                    found = true;
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            if !found {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(target) = keyboard_delete {
+                // Keep this frame complete. The next frame draws the edited schematic.
+                let deleted = self.delete_objects(text, target);
+                ui.ctx().request_repaint();
+                return deleted;
             }
             let edit_power =
                 r.secondary_clicked() && self.tool == Tool::Power && hovered_power.is_some();
-            if edit_power
-                || (self.tool == Tool::Cursor
-                    && ((!probe_clicked && r.double_clicked()) || r.secondary_clicked()))
+            if self.new_comment.is_none()
+                && (edit_power
+                    || (self.tool == Tool::Cursor
+                        && ((!probe_clicked && r.double_clicked()) || r.secondary_clicked())))
             {
                 let name = hovered_label.or_else(|| match self.symbol_at(point) {
-                    Some(Object::Part(n)) => Some(n),
+                    Some(Object::Part(n)) => {
+                        self.positions.get_key_value(&n).map(|(n, _)| n.as_str())
+                    }
                     _ => None,
                 });
-                if let Some(point) = hovered_power {
+                if let Some(index) = mouse.and_then(comment_at) {
+                    self.editing_comment = Some(CommentEdit {
+                        index,
+                        draft: self.comments[index].clone(),
+                        focus: true,
+                    });
+                } else if let Some(point) = hovered_power {
                     self.editing_power = Some((
                         point,
                         self.power_voltages
@@ -2132,10 +3046,7 @@ impl Schematic {
                             .map(ToString::to_string)
                             .unwrap_or_default(),
                     ));
-                } else if let Some(c) = cards(text)
-                    .into_iter()
-                    .find(|c| Some(c.name) == name.as_deref())
-                {
+                } else if let Some(c) = cards(text).into_iter().find(|c| Some(c.name) == name) {
                     self.cancel();
                     self.editing = Some(Properties {
                         part: c.part,
@@ -2145,6 +3056,10 @@ impl Schematic {
                                 parasitic_value(split_parasitics(c.part, c.value).1, key).to_owned()
                             })
                             .collect(),
+                        winding_polarity: transformer_model(
+                            c.value.split_whitespace().next().unwrap_or(""),
+                        )
+                        .1,
                         parameters: c
                             .part
                             .parameters()
@@ -2152,7 +3067,7 @@ impl Schematic {
                             .map(|(key, _)| {
                                 c.value
                                     .split_whitespace()
-                                    .chain(c.part.spec().2.split_whitespace())
+                                    .chain(c.part.parameter_defaults().split_whitespace())
                                     .filter_map(|s| s.split_once('='))
                                     .find(|(name, _)| name.eq_ignore_ascii_case(key))
                                     .map(|(_, v)| v.to_owned())
@@ -2180,11 +3095,29 @@ impl Schematic {
                 .or_else(|| r.is_pointer_button_down_on().then_some(mouse).flatten())
                 .filter(|&pos| rect.contains(pos))
             {
-                crate::ui::schematic_tool_cursor(ui, pos, rect, self.tool);
+                crate::ui::schematic_tool_cursor(ui, pos, rect, self.tool, self.light_canvas);
             }
+            let mut starting_comment = false;
             match self.tool {
+                _ if self.new_comment.is_some() => {}
+                Tool::Comment if r.clicked() => {
+                    self.new_comment = Some(Comment {
+                        position: point,
+                        text: String::new(),
+                    });
+                    self.tool = Tool::Cursor;
+                    starting_comment = true;
+                }
+                Tool::Comment if r.hovered() => ui.ctx().set_cursor_icon(egui::CursorIcon::Text),
                 Tool::Place(part) if inside => {
                     let (prefix, _, default_value) = part.spec();
+                    let custom_value;
+                    let default_value = if let Part::CustomTransformer { inputs, outputs } = part {
+                        custom_value = format!("os_xfmr_multi_{inputs}_{outputs} ratio=1");
+                        &custom_value
+                    } else {
+                        default_value
+                    };
                     let name = (1..)
                         .map(|i| format!("{prefix}{i}"))
                         .find(|n| {
@@ -2198,7 +3131,7 @@ impl Schematic {
                     let c = Card {
                         part,
                         name: &name,
-                        nodes: vec!["?"; part.layout().len()],
+                        nodes: vec!["?"; part.pin_count()],
                         value: default_value,
                         line: 0,
                     };
@@ -2209,13 +3142,13 @@ impl Schematic {
                         self.preview_turns,
                         scale,
                         self.american_resistor,
-                        ACCENT,
+                        (accent, paper),
                     );
                     for pin in part.terminals(point, self.preview_turns) {
                         if !degree.contains_key(&pin)
                             && !self.wires.iter().any(|&wire| on_wire(pin, wire))
                         {
-                            draw_open_pin(&p, screen(pin), scale, ACCENT);
+                            draw_open_pin(&p, screen(pin), scale, accent, paper);
                         }
                     }
                     obstacles.push(symbol_bounds(
@@ -2224,7 +3157,15 @@ impl Schematic {
                         self.preview_turns,
                         scale,
                     ));
-                    draw_labels(&p, screen(point), &c, scale, &segments, &mut obstacles);
+                    draw_labels(
+                        &p,
+                        screen(point),
+                        &c,
+                        scale,
+                        &segments,
+                        &mut obstacles,
+                        label,
+                    );
                     if (r.clicked() || drop) && !self.positions.values().any(|&p| p == point) {
                         if !text.contains('\n') {
                             text.push('\n');
@@ -2247,12 +3188,12 @@ impl Schematic {
                         let elbow = (point.0, a.1);
                         p.add(egui::Shape::line(
                             vec![screen(a), screen(elbow), screen(point)],
-                            Stroke::new(SCHEMATIC_STROKE, ACCENT),
+                            Stroke::new(SCHEMATIC_STROKE, accent),
                         ));
                         let mut route = self.routed_segments((a, elbow));
                         route.extend(self.routed_segments((elbow, point)));
                         for junction in self.preview_junctions(&route) {
-                            p.circle(screen(junction), 5., ACCENT, Stroke::new(1.5, PAPER));
+                            p.circle(screen(junction), 5., accent, Stroke::new(1.5, paper));
                         }
                     }
                     if r.hovered() {
@@ -2260,8 +3201,8 @@ impl Schematic {
                         let center = screen(point);
                         for axis in [vec2(11., 0.), vec2(0., 11.)] {
                             let line = [center - axis, center + axis];
-                            p.line_segment(line, Stroke::new(3., PAPER));
-                            p.line_segment(line, Stroke::new(1., ACCENT));
+                            p.line_segment(line, Stroke::new(3., paper));
+                            p.line_segment(line, Stroke::new(1., accent));
                         }
                     }
                     if r.clicked() {
@@ -2278,7 +3219,7 @@ impl Schematic {
                     }
                 }
                 Tool::Power if inside => {
-                    power(point, self.preview_voltage, self.preview_turns, ACCENT);
+                    power(point, self.preview_voltage, self.preview_turns, accent);
                     if r.clicked() && !self.powers.contains(&point) {
                         self.powers.push(point);
                         if self.preview_turns != 0 {
@@ -2291,7 +3232,7 @@ impl Schematic {
                     }
                 }
                 Tool::Ground if inside => {
-                    ground(point, ACCENT);
+                    ground(point, accent);
                     if r.clicked() && !self.grounds.contains(&point) {
                         self.grounds.push(point);
                         changed = true;
@@ -2301,7 +3242,7 @@ impl Schematic {
                     if inside {
                         let delta = (point.0 - anchor.0, point.1 - anchor.1);
                         let offset = |(x, y): Point| (x + delta.0, y + delta.1);
-                        for (index, card) in cards(text).into_iter().enumerate() {
+                        for card in &parts {
                             if self.selected.contains(&Object::Part(card.name.into())) {
                                 draw(
                                     &p,
@@ -2310,14 +3251,12 @@ impl Schematic {
                                     self.turns(card.name),
                                     scale,
                                     self.american_resistor,
-                                    ACCENT,
+                                    (accent, paper),
                                 );
-                                if let Some(layout) = &self.label_layout
-                                    && 11. * scale * p.ctx().pixels_per_point() >= 6.
-                                {
+                                if show_labels && let Some(bounds) = self.label_bounds(card.name) {
                                     let label_position =
-                                        project(layout[index]).min + (screen(delta) - origin);
-                                    let (name, value) = label_text(&p, &card, scale);
+                                        screen(delta) + bounds.min.to_vec2() * scale;
+                                    let (name, value) = label_text(&p, card, scale, label);
                                     paint_label(&p, label_position, name, value);
                                 }
                             }
@@ -2328,11 +3267,11 @@ impl Schematic {
                                     let (a, b) = self.wires[index];
                                     p.line(
                                         vec![screen(offset(a)), screen(offset(b))],
-                                        Stroke::new(SCHEMATIC_STROKE, ACCENT),
+                                        Stroke::new(SCHEMATIC_STROKE, accent),
                                     );
                                 }
                                 Object::Ground(index) => {
-                                    ground(offset(self.grounds[index]), ACCENT)
+                                    ground(offset(self.grounds[index]), accent)
                                 }
                                 Object::Power(index) => {
                                     let point = self.powers[index];
@@ -2340,23 +3279,30 @@ impl Schematic {
                                         offset(point),
                                         self.power_voltages.get(&point).copied(),
                                         self.power_turns.get(&point).copied().unwrap_or(0),
-                                        ACCENT,
+                                        accent,
                                     );
                                 }
-                                Object::Part(_) => {}
+                                Object::Comment(index) => {
+                                    let (_, galley) = &comments[index];
+                                    p.galley(
+                                        screen(offset(self.comments[index].position)),
+                                        galley.clone(),
+                                        comment_color,
+                                    );
+                                }
+                                Object::Part(_) | Object::Label(_) => {}
                             }
                         }
                         if r.clicked() {
+                            annotations_only = self.selected.iter().all(Object::is_annotation);
+                            self.selected
+                                .retain(|object| !matches!(object, Object::Label(_)));
                             changed = self.place_copy(text, delta);
                         }
                     }
                 }
                 Tool::Erase | Tool::Copy if r.clicked() => {
-                    if let Some(hit) = self.symbol_at(point).or_else(|| {
-                        mouse
-                            .and_then(|p| wire_at(p, &self.wires))
-                            .map(Object::Wire)
-                    }) {
+                    if let Some(hit) = mouse.and_then(|pos| hit_at(self, pos)) {
                         if !self.selected.contains(&hit) {
                             self.selected.clear();
                         }
@@ -2393,18 +3339,16 @@ impl Schematic {
                             && unique(&self.grounds)
                             && unique(&self.powers)
                         {
-                            changed = self
-                                .drag_origin
-                                .take()
-                                .is_some_and(|g| g != self.geometry());
+                            annotations_only = self.selected.iter().all(Object::is_annotation);
+                            if let Some(origin) = self.drag_origin.take() {
+                                changed = origin != self.geometry();
+                                self.translate_moved_labels(&origin);
+                                keep_label_layout = true;
+                            }
                             self.gesture = None;
                         }
                     } else if r.clicked()
-                        && let Some(hit) = self.symbol_at(point).or_else(|| {
-                            mouse
-                                .and_then(|pos| wire_at(pos, &self.wires))
-                                .map(Object::Wire)
-                        })
+                        && let Some(hit) = mouse.and_then(|pos| hit_at(self, pos))
                     {
                         if !self.selected.contains(&hit) {
                             self.selected.clear();
@@ -2414,6 +3358,7 @@ impl Schematic {
                         self.gesture = Some(Gesture::Move(point));
                     }
                 }
+                Tool::Cursor if captured_voltage_drag => {}
                 Tool::Cursor | Tool::Select | Tool::Erase | Tool::Copy => {
                     if r.drag_started_by(egui::PointerButton::Primary) || r.clicked() {
                         let pos = ui
@@ -2421,9 +3366,7 @@ impl Schematic {
                             .or(mouse)
                             .unwrap_or(screen(point));
                         let q = snap(pos);
-                        let hit = self
-                            .symbol_at(q)
-                            .or_else(|| wire_at(pos, &self.wires).map(Object::Wire));
+                        let hit = hit_at(self, pos);
                         if matches!(self.tool, Tool::Select | Tool::Erase | Tool::Copy)
                             && r.drag_started_by(egui::PointerButton::Primary)
                         {
@@ -2469,7 +3412,7 @@ impl Schematic {
                             ];
                             p.extend(egui::Shape::dashed_line(
                                 &outline,
-                                Stroke::new(1., ACCENT),
+                                Stroke::new(1., accent),
                                 5.,
                                 3.,
                             ));
@@ -2505,21 +3448,43 @@ impl Schematic {
                                         self.selected.insert(Object::Power(i));
                                     }
                                 }
+                                for (index, (bounds, _)) in comments.iter().enumerate() {
+                                    if selection.intersects(*bounds) {
+                                        self.selected.insert(Object::Comment(index));
+                                    }
+                                }
+                                if self.tool != Tool::Copy {
+                                    for (card, bounds) in &label_bounds {
+                                        if selection.intersects(*bounds) {
+                                            self.selected.insert(Object::Label(card.name.into()));
+                                        }
+                                    }
+                                }
                                 for (i, &(a, b)) in self.wires.iter().enumerate() {
                                     if contains(a) && contains(b) {
                                         self.selected.insert(Object::Wire(i));
                                     }
                                 }
                             } else {
+                                annotations_only = self.selected.iter().all(Object::is_annotation);
                                 self.wires.append(&mut self.drag_leads);
-                                changed = true;
+                                if let Some(origin) = self.drag_origin.take() {
+                                    changed = origin != self.geometry();
+                                    self.translate_moved_labels(&origin);
+                                }
+                                keep_label_layout = true;
                             }
                             self.drag_origin = None;
                             self.gesture = None;
                             if self.tool == Tool::Erase {
                                 return self.delete_objects(text, None);
                             }
-                            if self.tool == Tool::Copy && !self.selected.is_empty() {
+                            if self.tool == Tool::Copy
+                                && self
+                                    .selected
+                                    .iter()
+                                    .any(|object| !matches!(object, Object::Label(_)))
+                            {
                                 self.copy_anchor = Some(point);
                                 ui.ctx().request_repaint();
                             }
@@ -2527,6 +3492,97 @@ impl Schematic {
                     }
                 }
                 _ => {}
+            }
+            if let Some(mut draft) = self.new_comment.take() {
+                use egui::{Event, Key, Modifiers};
+                let (mut commit, mut cancel) = (false, false);
+                ui.input_mut(|input| {
+                    input.events.retain(|event| {
+                        if let Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } = event
+                        {
+                            if *key == Key::Escape {
+                                cancel = true;
+                                return false;
+                            }
+                            if *key == Key::Enter && modifiers.matches_exact(Modifiers::NONE) {
+                                commit = true;
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                });
+                let anchor = screen(draft.position);
+                let mut editor =
+                    ui.new_child(egui::UiBuilder::new().id_salt("inline comment").max_rect(
+                        egui::Rect::from_min_max(anchor, rect.max.max(anchor + vec2(1., 1.))),
+                    ));
+                editor.set_clip_rect(rect);
+                let font = FontId::proportional(COMMENT_FONT_SIZE * scale);
+                let mut layout_comment = |ui: &Ui, text: &dyn egui::TextBuffer, _: f32| {
+                    unwrapped_comment_layout(ui, text.as_str(), font.clone(), comment_color)
+                };
+                let response = editor.add(
+                    egui::TextEdit::multiline(&mut draft.text)
+                        .desired_rows(1)
+                        .desired_width(180.)
+                        .font(font.clone())
+                        .layouter(&mut layout_comment)
+                        .clip_text(true)
+                        .text_color(comment_color)
+                        .background_color(paper)
+                        .margin(0)
+                        .hint_text("Type a comment"),
+                );
+                if starting_comment {
+                    response.request_focus();
+                }
+                if cancel || commit {
+                    response.surrender_focus();
+                }
+                if !cancel {
+                    if commit || response.lost_focus() {
+                        let text = draft.text.trim();
+                        if !text.is_empty() {
+                            draft.text = text.to_owned();
+                            self.comments.push(draft);
+                            annotations_only = !changed;
+                            changed = true;
+                            ui.ctx().request_repaint();
+                        }
+                    } else {
+                        self.new_comment = Some(draft);
+                    }
+                }
+            }
+        }
+
+        if let Some((mut inputs, mut outputs)) = self.transformer_setup.take() {
+            let dialog =
+                crate::ui::dialog(ui.ctx(), "custom transformer", "Custom transformer", |ui| {
+                    egui::Grid::new("transformer windings").show(ui, |ui| {
+                        ui.label("Primary windings");
+                        ui.add(
+                            egui::DragValue::new(&mut inputs).range(1..=MAX_TRANSFORMER_WINDINGS),
+                        );
+                        ui.end_row();
+                        ui.label("Secondary windings");
+                        ui.add(
+                            egui::DragValue::new(&mut outputs).range(1..=MAX_TRANSFORMER_WINDINGS),
+                        );
+                        ui.end_row();
+                    });
+                    crate::ui::dialog_actions(ui, "Place", true, true)
+                });
+            if dialog.inner {
+                self.begin_placement(Part::CustomTransformer { inputs, outputs }, false);
+            } else if !dialog.should_close() {
+                self.transformer_setup = Some((inputs, outputs));
             }
         }
 
@@ -2599,6 +3655,31 @@ impl Schematic {
                                 {
                                     crate::ui::dialog_field(ui, label, v);
                                 }
+                                if let Some((inputs, outputs)) = edit.part.transformer_windings() {
+                                    let tapped = edit.part == Part::CenterTappedTransformer;
+                                    let outputs = if tapped { 2 } else { outputs };
+                                    for index in 0..inputs + outputs {
+                                        let name = if index < inputs {
+                                            format!("Primary {}", index + 1)
+                                        } else if tapped {
+                                            if index == inputs {
+                                                "Upper secondary".into()
+                                            } else {
+                                                "Lower secondary".into()
+                                            }
+                                        } else {
+                                            format!("Secondary {}", index - inputs + 1)
+                                        };
+                                        let bit = 1 << index;
+                                        let mut reversed = edit.winding_polarity & bit != 0;
+                                        ui.label(name);
+                                        if ui.checkbox(&mut reversed, "Reverse polarity").changed()
+                                        {
+                                            edit.winding_polarity ^= bit;
+                                        }
+                                        ui.end_row();
+                                    }
+                                }
                             } else {
                                 crate::ui::dialog_field(ui, "Value", &mut edit.value);
                             }
@@ -2632,6 +3713,19 @@ impl Schematic {
                         Some(
                             "Enter two supply voltages with the positive rail above the negative rail.",
                         )
+                    } else if edit.part.adjustable_transistor_model().is_some() {
+                        edit.part.parameters().iter().zip(&edit.parameters).find_map(|((key, _), value)| {
+                            match crate::analysis::number(value) {
+                                None => Some("Enter a numeric value for each model parameter."),
+                                Some(n) if matches!(*key, "bf" | "is" | "nf" | "kp" | "beta") && n <= 0. => {
+                                    Some("BF, IS, NF, KP and BETA must be positive where applicable.")
+                                }
+                                Some(n) if *key != "vto" && n < 0. => {
+                                    Some("Only VTO can be negative.")
+                                }
+                                _ => None,
+                            }
+                        })
                     } else if edit.part != Part::Op
                         && edit
                             .parameters
@@ -2658,8 +3752,22 @@ impl Schematic {
             if dialog.inner {
                 if let Some(c) = cards(text).into_iter().find(|c| c.name == edit.original) {
                     if edit.part.spec().0 == 'X' && edit.part != Part::Diode {
-                        let model = edit.part.spec().2.split_whitespace().next().unwrap();
-                        let mut fields = vec![model.to_owned()];
+                        let model = edit.part.adjustable_transistor_model().unwrap_or_else(|| {
+                            if matches!(edit.part, Part::CustomTransformer { .. }) {
+                                c.value.split_whitespace().next().unwrap()
+                            } else {
+                                edit.part.spec().2.split_whitespace().next().unwrap()
+                            }
+                        });
+                        let base = transformer_model(model).0;
+                        let model_name = if edit.part.transformer_windings().is_some()
+                            && edit.winding_polarity != 0
+                        {
+                            format!("{base}_pol_{}", edit.winding_polarity)
+                        } else {
+                            base.to_owned()
+                        };
+                        let mut fields = vec![model_name];
                         for (key, value) in
                             c.value.split_whitespace().filter_map(|s| s.split_once('='))
                         {
@@ -2711,6 +3819,7 @@ impl Schematic {
                     if let Some(turns) = self.rotations.remove(&edit.original) {
                         self.rotations.insert(edit.reference.clone(), turns);
                     }
+                    self.rename_label(&edit.original, &edit.reference);
                     if self.selected.remove(&Object::Part(edit.original)) {
                         self.selected.insert(Object::Part(edit.reference));
                     }
@@ -2726,8 +3835,43 @@ impl Schematic {
                 self.editing = Some(edit);
             }
         }
-        if changed {
+        if changed && !annotations_only {
+            let layout = if keep_label_layout {
+                self.label_layout.take()
+            } else {
+                None
+            };
             self.sync(text);
+            self.label_layout = layout;
+        }
+        if let Some(mut edit) = self.editing_comment.take() {
+            let dialog =
+                crate::ui::dialog(ui.ctx(), "schematic comment", "Schematic comment", |ui| {
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let color = ui.visuals().text_color();
+                    let mut layout_comment = |ui: &Ui, text: &dyn egui::TextBuffer, _: f32| {
+                        unwrapped_comment_layout(ui, text.as_str(), font.clone(), color)
+                    };
+                    let response = ui.add(
+                        egui::TextEdit::multiline(&mut edit.draft.text)
+                            .layouter(&mut layout_comment)
+                            .clip_text(true)
+                            .hint_text("Comment text")
+                            .desired_width(ui.available_width())
+                            .desired_rows(3),
+                    );
+                    if std::mem::take(&mut edit.focus) {
+                        response.request_focus();
+                    }
+                    crate::ui::dialog_actions(ui, "Apply", !edit.draft.text.trim().is_empty(), true)
+                });
+            if dialog.inner {
+                edit.draft.text = edit.draft.text.trim().to_owned();
+                changed |= self.comments[edit.index] != edit.draft;
+                self.comments[edit.index] = edit.draft;
+            } else if !dialog.should_close() {
+                self.editing_comment = Some(edit);
+            }
         }
         changed
     }
@@ -2787,13 +3931,19 @@ fn power_arrow(painter: &egui::Painter, pin: Pos2, scale: f32, turns: u8, color:
     }
 }
 
-fn probe_cursor(ui: &Ui, tip: Pos2, current: bool) {
+fn probe_cursor(
+    ui: &Ui,
+    tip: Pos2,
+    current: Option<egui::Vec2>,
+    light: bool,
+    voltage_color: Option<Color32>,
+) {
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
     let painter = ui.ctx().layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,
         egui::Id::unique("schematic probe cursor"),
     ));
-    let ink = Color32::from_gray(35);
+    let ink = Color32::from_gray(if light { 35 } else { 228 });
     let path = |points: &[(f32, f32)], width| {
         painter.line(
             points.iter().map(|&(x, y)| tip + vec2(x, y)).collect(),
@@ -2807,7 +3957,7 @@ fn probe_cursor(ui: &Ui, tip: Pos2, current: bool) {
             Stroke::NONE,
         ));
     };
-    if current {
+    if let Some(direction) = current {
         // The center of the jaws is the measurement point.
         for side in [-1., 1.] {
             let jaw: Vec<_> = (0..=12)
@@ -2834,6 +3984,13 @@ fn probe_cursor(ui: &Ui, tip: Pos2, current: bool) {
             egui::StrokeKind::Middle,
         );
         path(&[(-2., 12.), (2., 12.)], 1.5);
+        let arrow = direction * 13.;
+        let offset = if direction.x != 0. {
+            vec2(0., 24.)
+        } else {
+            vec2(15., 7.)
+        };
+        painter.arrow(tip + offset - arrow * 0.5, arrow, Stroke::new(1.8, ink));
     } else {
         // The pointed end of the voltage probe is the measurement point.
         fill(&[(0., 0.), (2.5, -5.5), (5.5, -2.5)]);
@@ -2843,7 +4000,7 @@ fn probe_cursor(ui: &Ui, tip: Pos2, current: bool) {
         for end in grip {
             painter.circle_filled(end, 4., ink);
         }
-        let accent = Color32::from_rgb(112, 192, 211);
+        let accent = voltage_color.unwrap_or(Color32::from_rgb(112, 192, 211));
         painter.line(grip.to_vec(), Stroke::new(4.5, accent));
         for end in grip {
             painter.circle_filled(end, 2.25, accent);
@@ -2861,8 +4018,27 @@ fn probe_cursor(ui: &Ui, tip: Pos2, current: bool) {
     }
 }
 
+fn transformer_half_height(part: Part, inputs: u8, outputs: u8) -> f32 {
+    let half_steps = if part == Part::CenterTappedTransformer {
+        2 * WINDING_HALF_SPAN
+    } else {
+        3 * i32::from(inputs.max(outputs) - 1) + WINDING_HALF_SPAN
+    };
+    half_steps as f32 * GRID
+}
+
 fn symbol_bounds(part: Part, center: Pos2, turns: u8, scale: f32) -> egui::Rect {
-    let size = if part.layout().len() > 2 {
+    if let Some((inputs, outputs)) = part.transformer_windings() {
+        let half_height = transformer_half_height(part, inputs, outputs);
+        let size = vec2(2. * PIN_OFFSET + 5., 2. * half_height + 6.);
+        let size = if turns.is_multiple_of(2) {
+            size
+        } else {
+            vec2(size.y, size.x)
+        };
+        return egui::Rect::from_center_size(center, size * scale).expand(SCHEMATIC_STROKE / 2.);
+    }
+    let size = if part.pin_count() > 2 {
         vec2(2. * PIN_OFFSET + 5., 2. * PIN_OFFSET + 5.)
     } else if turns.is_multiple_of(2) {
         vec2(2. * PIN_OFFSET, 36.)
@@ -2872,6 +4048,35 @@ fn symbol_bounds(part: Part, center: Pos2, turns: u8, scale: f32) -> egui::Rect 
     egui::Rect::from_center_size(center, size * scale).expand(SCHEMATIC_STROKE / 2.)
 }
 
+fn unwrapped_comment_layout(
+    ui: &Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, f32::INFINITY);
+    job.keep_trailing_whitespace = true;
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+fn label_move_offset(
+    name: &str,
+    positions: &HashMap<String, Point>,
+    origin: &Geometry,
+) -> egui::Vec2 {
+    let (x, y) = positions[name];
+    origin
+        .positions
+        .get(name)
+        .map_or(egui::Vec2::ZERO, |&(old_x, old_y)| {
+            vec2((x - old_x) as f32, (y - old_y) as f32) * GRID
+        })
+}
+
+fn world_position((x, y): Point) -> Pos2 {
+    egui::pos2(x as f32 * GRID, y as f32 * GRID)
+}
+
 fn draw_labels(
     p: &egui::Painter,
     center: Pos2,
@@ -2879,13 +4084,14 @@ fn draw_labels(
     scale: f32,
     wires: &[[Pos2; 2]],
     occupied: &mut Vec<egui::Rect>,
+    label: Color32,
 ) -> egui::Rect {
-    let (name, value) = label_text(p, card, scale);
+    let (name, value) = label_text(p, card, scale, label);
     let rect = place_label(
         center,
         scale,
         label_size(&name, &value),
-        12.,
+        LABEL_CLEARANCE,
         wires,
         occupied,
         egui::Rect::EVERYTHING,
@@ -2912,6 +4118,7 @@ fn label_text(
     p: &egui::Painter,
     card: &Card<'_>,
     scale: f32,
+    color: Color32,
 ) -> (std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>) {
     let value = split_parasitics(card.part, card.value).0;
     let value = value
@@ -2924,8 +4131,16 @@ fn label_text(
     } else {
         value
     };
-    let name = p.layout_no_wrap(card.name.into(), FontId::proportional(13. * scale), LABEL);
-    let value = p.layout_no_wrap(value.into(), FontId::proportional(11. * scale), LABEL);
+    let name = p.layout_no_wrap(
+        card.name.into(),
+        FontId::proportional(LABEL_NAME_SIZE * scale),
+        color,
+    );
+    let value = p.layout_no_wrap(
+        value.into(),
+        FontId::proportional(LABEL_VALUE_SIZE * scale),
+        color,
+    );
     (name, value)
 }
 
@@ -2943,8 +4158,8 @@ fn paint_label(
     value: std::sync::Arc<egui::Galley>,
 ) {
     let value_pos = pos + vec2(0., name.size().y);
-    p.galley(pos, name, LABEL);
-    p.galley(value_pos, value, LABEL);
+    p.galley(pos, name, Color32::WHITE);
+    p.galley(value_pos, value, Color32::WHITE);
 }
 
 fn place_label(
@@ -2997,13 +4212,13 @@ fn place_label(
     unreachable!()
 }
 
-fn draw_open_pin(p: &egui::Painter, pin: Pos2, scale: f32, color: Color32) {
+fn draw_open_pin(p: &egui::Painter, pin: Pos2, scale: f32, color: Color32, paper: Color32) {
     let radius = 2. * scale;
     let width = SCHEMATIC_STROKE.min(radius);
     p.rect(
         egui::Rect::from_center_size(pin, vec2(radius * 2., radius * 2.)),
         0,
-        PAPER,
+        paper,
         Stroke::new(width, color),
         egui::StrokeKind::Middle,
     );
@@ -3016,15 +4231,10 @@ fn draw(
     turns: u8,
     scale: f32,
     american: bool,
-    color: Color32,
+    (color, paper): (Color32, Color32),
 ) {
     let transform = |x: f32, y: f32| {
-        let (u, v) = match turns % 4 {
-            0 => (x, y),
-            1 => (-y, x),
-            2 => (-x, -y),
-            _ => (y, -x),
-        };
+        let (u, v) = orient_offset((x, y), turns);
         center + vec2(u, v) * scale
     };
     let pen = Stroke::new(SCHEMATIC_STROKE, color);
@@ -3064,7 +4274,7 @@ fn draw(
                     .into_iter()
                     .map(|(x, y)| transform(x, y))
                     .collect(),
-                PAPER,
+                paper,
                 pen,
             ));
             16.
@@ -3139,23 +4349,58 @@ fn draw(
             }
             return;
         }
-        Part::Transformer => {
-            for sign in [-1., 1.] {
-                path(&[(sign * 28., -14.), (sign * 11., -14.)]);
-                path(&[(sign * 11., 14.), (sign * 28., 14.)]);
-                let coil: Vec<_> = (0..4)
-                    .flat_map(|turn| {
-                        (0..=10).map(move |i| {
-                            let angle = i as f32 * std::f32::consts::PI / 10.;
-                            (
-                                sign * (11. - 5. * angle.sin()),
-                                -14. + 7. * turn as f32 - 3.5 * angle.cos() + 3.5,
-                            )
+        Part::Transformer | Part::CenterTappedTransformer | Part::CustomTransformer { .. } => {
+            let (inputs, outputs) = part.transformer_windings().unwrap();
+            let tapped = part == Part::CenterTappedTransformer;
+            let half_height = WINDING_HALF_SPAN as f32 * GRID;
+            let core = transformer_half_height(part, inputs, outputs) + 2.;
+            let polarity = transformer_model(value.split_whitespace().next().unwrap_or("")).1;
+            let mut index = 0;
+            for (sign, count) in [(-1., inputs), (1., outputs)] {
+                let pin_x = sign * PIN_OFFSET;
+                let tapped_secondary = tapped && sign > 0.;
+                let (count, half_pitch) = if tapped_secondary {
+                    (2, WINDING_HALF_SPAN)
+                } else {
+                    (count, 3)
+                };
+                let coil_x = sign * 13.;
+                let dot_x = sign * 20.;
+                for winding in winding_centers(count, half_pitch) {
+                    let y = winding as f32 * GRID;
+                    for end in [-1., 1.] {
+                        let pin_y = y + end * half_height;
+                        if !tapped_secondary || pin_y != 0. || winding < 0 {
+                            path(&[(pin_x, pin_y), (coil_x, pin_y)]);
+                        }
+                    }
+                    let coil: Vec<_> = (0..4)
+                        .flat_map(|turn| {
+                            (0..=10).map(move |i| {
+                                let angle = i as f32 * std::f32::consts::PI / 10.;
+                                (
+                                    coil_x - sign * 6. * angle.sin(),
+                                    y - half_height
+                                        + half_height / 2.
+                                            * (turn as f32 + (1. - angle.cos()) / 2.),
+                                )
+                            })
                         })
-                    })
-                    .collect();
-                path(&coil);
-                body(&[(sign * 2.5, -15.), (sign * 2.5, 15.)]);
+                        .collect();
+                    path(&coil);
+                    let dot_end = if polarity & (1 << index) == 0 {
+                        -1.
+                    } else {
+                        1.
+                    };
+                    p.circle_filled(
+                        transform(dot_x, y + dot_end * (half_height - 6.)),
+                        2. * scale,
+                        color,
+                    );
+                    index += 1;
+                }
+                body(&[(sign * 3., -core), (sign * 3., core)]);
             }
             return;
         }
@@ -3232,7 +4477,12 @@ fn draw(
                 path(&[(-10., -11.), (-10., -5.)]);
                 3.
             } else {
-                p.circle(center, 14. * scale, Color32::from_rgb(255, 250, 194), pen);
+                let fill = if paper == Color32::WHITE {
+                    Color32::from_rgb(255, 250, 194)
+                } else {
+                    Color32::from_rgb(98, 82, 41)
+                };
+                p.circle(center, 14. * scale, fill, pen);
                 path(&[(-16., -13.), (-10., -13.)]);
                 path(&[(-13., -16.), (-13., -10.)]);
                 // Keep the waveform upright when the source rotates.
@@ -3273,6 +4523,119 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restoring_older_transformer_layout_moves_connected_pins() {
+        let deck = "Transformer\nX1 input 0 a tap b os_xfmr_ct ratio=1\n.end\n";
+        for (marker, primary_x, primary_y) in [
+            ("", 7, 4),
+            ("extended_transformer_primaries:true,", 7, 3),
+            ("wide_transformer_windings:true,", 8, 4),
+        ] {
+            let legacy: Geometry = ron::from_str(&format!(
+                r#"({marker}rotations:{{"X1":1}},positions:{{"X1":(6,6)}},wires:[(({primary_x},{primary_y}),(9,{primary_y})),(({primary_x},8),(13,8))],grounds:[({},{primary_y})],powers:[])"#,
+                12 - primary_x,
+            ))
+            .unwrap();
+            let mut schematic = Schematic::default();
+            schematic.restore(legacy, deck);
+
+            assert_eq!(
+                schematic.kinds["X1"].terminals((6, 6), 1),
+                [(8, 4), (4, 4), (10, 8), (6, 8), (2, 8)]
+            );
+            assert_eq!(
+                schematic.wires,
+                [((8, 4), (9, primary_y)), ((10, 8), (13, 8))]
+            );
+            assert_eq!(schematic.grounds, [(4, 4)]);
+            let migrated = schematic.geometry();
+            schematic.restore(migrated.clone(), deck);
+            assert!(schematic.geometry() == migrated);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ngspice on PATH"]
+    fn reversed_transformer_dots_change_polarity_independently() {
+        let mut deck = concat!(
+            "Reversed transformer windings\nV1 in 0 4\n",
+            "X1 in 0 out 0 os_xfmr_pol_1 ratio=2\n",
+            "X2 in 0 high 0 low os_xfmr_ct_pol_4 ratio=2\n",
+            "X3 in 0 a 0 b 0 os_xfmr_multi_1_2_pol_2 ratio=2\n",
+            ".op\n.end\n",
+        )
+        .to_owned();
+        for model in [
+            "os_xfmr_pol_1",
+            "os_xfmr_ct_pol_4",
+            "os_xfmr_multi_1_2_pol_2",
+        ] {
+            ensure_model(&mut deck, model);
+        }
+        assert_eq!(cards(&deck).len(), 4);
+        let run = crate::simulation::simulate(&deck);
+        let wave = run.waveform.expect(&run.log);
+        for (node, expected) in [
+            ("out", -8.),
+            ("high", 4.),
+            ("low", 4.),
+            ("a", -8.),
+            ("b", 8.),
+        ] {
+            let voltage = format!("v({node})");
+            let result = wave
+                .traces
+                .iter()
+                .find(|trace| trace.name.eq_ignore_ascii_case(&voltage))
+                .unwrap();
+            assert!((result.samples[0] - expected).abs() < 1e-8, "{node}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ngspice on PATH"]
+    fn transformer_windings_preserve_polarity_and_reflect_load() {
+        let mut deck = concat!(
+            "Transformer windings\n",
+            "V1 in 0 4\n",
+            "X1 in 0 high 0 low os_xfmr_ct ratio=2\n",
+            "R1 high low 1k\n",
+            "V2 drive 0 3\n",
+            "X2 open_a open_b drive 0 out_a 0 out_b 0 spare_a spare_b os_xfmr_multi_2_3 ratio=2\n",
+            "R2 out_a 0 1k\nR3 out_b 0 1k\n",
+            ".op\n.end\n",
+        )
+        .to_owned();
+        ensure_model(&mut deck, "os_xfmr_ct");
+        ensure_model(&mut deck, "os_xfmr_multi_2_3");
+        let parts = cards(&deck);
+        let custom = parts.iter().find(|card| card.name == "X2").unwrap();
+        assert_eq!(custom.part.terminals((0, 0), 0).len(), 10);
+        assert_eq!(custom.part.terminals((0, 0), 1)[0], (5, -2));
+
+        let run = crate::simulation::simulate(&deck);
+        let wave = run.waveform.expect(&run.log);
+        for (name, expected) in [
+            ("V(high)", 4.),
+            ("V(low)", -4.),
+            ("I(v1)", -0.016),
+            ("V(out_a)", 6.),
+            ("V(out_b)", 6.),
+            ("I(v2)", -0.024),
+        ] {
+            let trace = wave
+                .traces
+                .iter()
+                .find(|trace| trace.name.eq_ignore_ascii_case(name))
+                .unwrap();
+            assert!(
+                (trace.samples[0] - expected).abs() < 1e-8,
+                "{name}: {}",
+                trace.samples[0]
+            );
+        }
+    }
 
     #[test]
     #[ignore = "requires ngspice on PATH"]
@@ -3500,7 +4863,7 @@ R1 in 0 1k
                 |ui| {
                     expected *= ui.input(crate::ui::canvas_zoom_factor);
                     let origin = ui.cursor().min;
-                    schematic.show(ui, &mut text, None);
+                    schematic.show(ui, &mut text, None, None);
                     let scale = 1.25_f32.powf(schematic.zoom_steps);
                     assert!((scale - expected as f32).abs() < 1e-5);
                     let world = (cursor - origin - schematic.pan) / scale;
@@ -3547,7 +4910,7 @@ R1 in 0 1k
                     ..Default::default()
                 },
                 |ui| {
-                    schematic.show(ui, &mut deck, None);
+                    schematic.show(ui, &mut deck, None, None);
                 },
             );
             let squares = frame.shapes.iter().filter(|shape| matches!(&shape.shape,
@@ -3566,7 +4929,7 @@ R1 in 0 1k
         schematic.selected.insert(Object::Part("V1".into()));
         let center = schematic.positions["V1"];
         for turn in 1..=4 {
-            assert!(schematic.rotate());
+            assert!(schematic.change_orientation(OrientationEdit::Rotate));
             schematic.sync(&mut text);
             assert_eq!(cards(&text)[0].nodes, ["in", "0"]);
             assert!(schematic.grounds.contains(&pins(center, turn)[1]));
@@ -3576,6 +4939,34 @@ R1 in 0 1k
         schematic.zoom(2., Some(cursor));
         let after = (cursor - schematic.pan) / (GRID * 1.25_f32.powf(schematic.zoom_steps));
         assert!((before - after).length() < 0.001);
+    }
+
+    #[test]
+    fn mirrors_connected_transistor_and_preserves_terminal_order() {
+        let mut text =
+            "Mirror test\nX1 collector base 0 os_npn\nR1 collector base 1k\n.end\n".to_owned();
+        let mut schematic = Schematic::default();
+        schematic.import(&text);
+        schematic.selected.insert(Object::Part("X1".into()));
+        let (x, y) = schematic.positions["X1"];
+        assert!(schematic.change_orientation(OrientationEdit::MirrorHorizontal));
+        assert_eq!(
+            Part::Npn.terminals((x, y), schematic.turns("X1")),
+            [(x - 1, y - 2), (x + 2, y), (x - 1, y + 2)]
+        );
+        schematic.sync(&mut text);
+        assert_eq!(cards(&text)[0].nodes, ["collector", "base", "0"]);
+
+        assert!(schematic.change_orientation(OrientationEdit::MirrorVertical));
+        schematic.sync(&mut text);
+        assert_eq!(cards(&text)[0].nodes, ["collector", "base", "0"]);
+        let geometry = ron::to_string(&schematic.geometry()).unwrap();
+        let mut restored = Schematic::default();
+        restored.restore(ron::from_str(&geometry).unwrap(), &text);
+        assert_eq!(
+            Part::Npn.terminals((x, y), restored.turns("X1")),
+            [(x - 1, y + 2), (x + 2, y), (x - 1, y - 2)]
+        );
     }
 
     #[test]

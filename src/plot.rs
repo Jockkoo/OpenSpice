@@ -1,8 +1,8 @@
 use crate::waveform::{Quantity, Trace, Waveform};
 use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
 
-pub const BACK: Color32 = Color32::from_rgb(5, 8, 10);
-const GRID: Color32 = Color32::from_rgb(55, 65, 69);
+pub const BACK: Color32 = Color32::from_rgb(23, 25, 29);
+const GRID: Color32 = Color32::from_rgb(58, 63, 70);
 const LABEL: Color32 = Color32::from_rgb(176, 190, 196);
 const CURSOR: Color32 = Color32::from_rgb(61, 217, 214);
 const COLORS: [Color32; 5] = [
@@ -113,6 +113,7 @@ struct TraceDisplay {
     levels: Vec<Vec<Peaks>>,
     view: Option<(Range, usize)>,
     indices: Vec<usize>,
+    dc_offset: f64,
 }
 
 impl TraceDisplay {
@@ -203,6 +204,69 @@ impl TraceDisplay {
     }
 }
 
+const MEASUREMENT_NAMES: [(&str, &str); 5] = [
+    ("Peak to peak", "Pk–Pk"),
+    ("RMS", "RMS"),
+    ("Mean", "Mean"),
+    ("Minimum", "Min"),
+    ("Maximum", "Max"),
+];
+
+#[derive(Default)]
+struct TraceMeasurements {
+    enabled: [bool; 5],
+    ac_coupled: bool,
+    values: Option<[f64; 5]>,
+}
+
+impl TraceMeasurements {
+    fn menu(&mut self, ui: &mut Ui, trace: &Trace, transient: bool) -> bool {
+        ui.strong(&trace.name);
+        let mut changed = false;
+        if transient {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .radio_value(&mut self.ac_coupled, false, "DC coupling")
+                    .changed();
+                changed |= ui
+                    .radio_value(&mut self.ac_coupled, true, "AC coupling")
+                    .on_hover_text("Subtract the full trace’s time-weighted mean")
+                    .changed();
+            });
+            ui.separator();
+        }
+        ui.weak("Full trace");
+        for ((label, _), enabled) in MEASUREMENT_NAMES.iter().zip(&mut self.enabled) {
+            ui.checkbox(enabled, *label);
+        }
+        changed
+    }
+
+    fn readout(&mut self, wave: &Waveform, trace: &Trace, offset: f64) -> Option<String> {
+        if !self.enabled.contains(&true) {
+            return None;
+        }
+        let values = self
+            .values
+            .get_or_insert_with(|| measure_trace(wave, trace, offset));
+        Some(
+            MEASUREMENT_NAMES
+                .iter()
+                .zip(self.enabled)
+                .zip(values.iter())
+                .filter(|((_, enabled), _)| *enabled)
+                .map(|(((_, short), _), &value)| {
+                    format!(
+                        "{short} {}",
+                        measurement_value(value, trace.quantity.unit())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("   ·   "),
+        )
+    }
+}
+
 pub struct Plot {
     wave: Waveform,
     visible: Vec<bool>,
@@ -213,6 +277,9 @@ pub struct Plot {
     current: Range,
     sample: Option<usize>,
     zoom_anchor: Option<egui::Pos2>,
+    selection_delta: Option<String>,
+    menu_trace: Option<usize>,
+    measurements: std::collections::HashMap<String, TraceMeasurements>,
 }
 
 impl Plot {
@@ -239,6 +306,9 @@ impl Plot {
             current: unit,
             sample: None,
             zoom_anchor: None,
+            selection_delta: None,
+            menu_trace: None,
+            measurements: Default::default(),
         };
         plot.reset();
         plot
@@ -251,8 +321,21 @@ impl Plot {
         if isolate {
             self.visible.fill(false);
         }
-        if !self.visible[index] {
-            self.visible[index] = true;
+        let mut changed = !self.visible[index];
+        if let Some((component, reversed)) = crate::waveform::current_trace(name) {
+            let opposite = format!("{}I({component})", if reversed { "" } else { "-" });
+            if let Some(other) = self
+                .wave
+                .traces
+                .iter()
+                .position(|trace| trace.name.eq_ignore_ascii_case(&opposite))
+            {
+                changed |= self.visible[other];
+                self.visible[other] = false;
+            }
+        }
+        self.visible[index] = true;
+        if changed {
             self.fit_vertical();
         }
         true
@@ -265,35 +348,120 @@ impl Plot {
                 next.visible[index] = true;
             }
         }
+        next.measurements = std::mem::take(&mut self.measurements);
+        for measurements in next.measurements.values_mut() {
+            measurements.values = None;
+        }
+        for index in 0..next.wave.traces.len() {
+            next.update_coupling(index);
+        }
         next.fit_vertical();
         next.grid_dash = self.grid_dash.take();
         *self = next;
     }
 
     fn trace_index(&mut self, name: &str) -> Option<usize> {
-        if name == "V(0)" && !self.wave.traces.iter().any(|trace| trace.name == name) {
-            self.wave.traces.push(Trace {
-                name: name.into(),
-                quantity: Quantity::Voltage,
-                samples: vec![0.; self.wave.time.len()],
-            });
-            self.visible.push(false);
-            self.displays.push(TraceDisplay::default());
-        }
-        self.wave
+        if let Some(index) = self
+            .wave
             .traces
             .iter()
             .position(|trace| trace.name.eq_ignore_ascii_case(name))
+        {
+            return Some(index);
+        }
+        let reversed_current =
+            crate::waveform::current_trace(name).filter(|(_, reversed)| *reversed);
+        let samples = if let Some((component, _)) = reversed_current {
+            let original = format!("I({component})");
+            let trace = self.wave.traces.iter().find(|trace| {
+                trace.name.eq_ignore_ascii_case(&original) && trace.quantity == Quantity::Current
+            })?;
+            if self.wave.analysis == crate::analysis::Analysis::Ac {
+                trace.samples.clone()
+            } else {
+                trace.samples.iter().map(|value| -value).collect()
+            }
+        } else if name.eq_ignore_ascii_case("V(0)") {
+            vec![0.; self.wave.time.len()]
+        } else {
+            let (positive, negative) = crate::waveform::differential_nodes(name)?;
+            // Only synthesize differences of ordinary node voltages.
+            if [positive, negative]
+                .iter()
+                .any(|node| node.contains([',', '(', ')']))
+            {
+                return None;
+            }
+            let positive = self.trace_index(&format!("V({positive})"))?;
+            let negative = self.trace_index(&format!("V({negative})"))?;
+            let positive = &self.wave.traces[positive];
+            let negative = &self.wave.traces[negative];
+            if self.wave.analysis == crate::analysis::Analysis::Ac {
+                (0..self.wave.time.len())
+                    .map(|i| {
+                        let (ar, ai) = positive
+                            .phasors
+                            .as_ref()
+                            .map_or((0., 0.), |values| values[i]);
+                        let (br, bi) = negative
+                            .phasors
+                            .as_ref()
+                            .map_or((0., 0.), |values| values[i]);
+                        (ar - br).hypot(ai - bi)
+                    })
+                    .collect()
+            } else {
+                positive
+                    .samples
+                    .iter()
+                    .zip(&negative.samples)
+                    .map(|(a, b)| a - b)
+                    .collect()
+            }
+        };
+        self.wave.traces.push(Trace {
+            name: name.into(),
+            quantity: if reversed_current.is_some() {
+                Quantity::Current
+            } else {
+                Quantity::Voltage
+            },
+            samples,
+            phasors: None,
+        });
+        self.visible.push(false);
+        self.displays.push(TraceDisplay::default());
+        let index = self.wave.traces.len() - 1;
+        self.update_coupling(index);
+        Some(index)
     }
 
     pub fn has_traces(&self) -> bool {
         self.visible.contains(&true)
     }
 
+    fn update_coupling(&mut self, index: usize) {
+        let trace = &self.wave.traces[index];
+        let measurement = self.measurements.get_mut(&trace.name.to_ascii_lowercase());
+        self.displays[index].dc_offset = measurement.map_or(0., |settings| {
+            settings.values = None;
+            if settings.ac_coupled && self.wave.analysis == crate::analysis::Analysis::Transient {
+                measure_trace(&self.wave, trace, 0.)[2]
+            } else {
+                0.
+            }
+        });
+    }
+
     pub fn reset(&mut self) {
+        self.fit_horizontal();
+        self.fit_vertical();
+        self.selection_delta = None;
+    }
+
+    fn fit_horizontal(&mut self) {
         let time = &self.wave.time;
         self.x = Range::from_limits(time[0], time[time.len() - 1], 0.0).fit_divisions(10, false);
-        self.fit_vertical();
     }
 
     fn fit_vertical(&mut self) {
@@ -303,11 +471,17 @@ impl Plot {
         ] {
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
-            for (trace, &visible) in self.wave.traces.iter().zip(&self.visible) {
+            for ((trace, &visible), display) in self
+                .wave
+                .traces
+                .iter()
+                .zip(&self.visible)
+                .zip(&self.displays)
+            {
                 if visible && trace.quantity == quantity {
                     for &value in &trace.samples {
-                        min = min.min(value);
-                        max = max.max(value);
+                        min = min.min(value - display.dc_offset);
+                        max = max.max(value - display.dc_offset);
                     }
                 }
             }
@@ -327,32 +501,67 @@ impl Plot {
 
     pub fn legend(&mut self, ui: &mut Ui) {
         let mut changed = false;
+        let mut coupling_change = None;
+        let transient = self.wave.analysis == crate::analysis::Analysis::Transient;
         ui.horizontal_wrapped(|ui| {
             for (i, t) in self.wave.traces.iter().enumerate() {
                 let color = COLORS[i % COLORS.len()];
                 if !self.visible[i] {
                     continue;
                 }
-                let text = egui::RichText::new(format!("C{}   {}", i + 1, t.name)).color(BACK);
+                let name = t.name.to_ascii_lowercase();
+                let ac = transient
+                    && self
+                        .measurements
+                        .get(&name)
+                        .is_some_and(|settings| settings.ac_coupled);
+                let marker = if ac { "  ·  AC" } else { "" };
+                let text =
+                    egui::RichText::new(format!("C{}   {}{marker}", i + 1, t.name)).color(BACK);
                 let button = egui::Button::new(text)
                     .fill(color)
                     .stroke(Stroke::new(1., color));
-                if ui
-                    .add(button)
-                    .on_hover_text(format!("Remove {}", t.name))
-                    .clicked()
-                {
-                    self.visible[i] = false;
-                    changed = true;
-                }
+                ui.horizontal(|ui| {
+                    let response = ui
+                        .add(button)
+                        .on_hover_text("Left-click to remove · Right-click for measurements");
+                    egui::Popup::context_menu(&response)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            if self
+                                .measurements
+                                .entry(name.clone())
+                                .or_default()
+                                .menu(ui, t, transient)
+                            {
+                                coupling_change = Some(i);
+                            }
+                        });
+                    if response.clicked() {
+                        self.visible[i] = false;
+                        changed = true;
+                    } else if coupling_change != Some(i)
+                        && let Some(readout) =
+                            self.measurements.get_mut(&name).and_then(|measurements| {
+                                measurements.readout(&self.wave, t, self.displays[i].dc_offset)
+                            })
+                    {
+                        ui.add(egui::Label::new(egui::RichText::new(readout).color(color)).wrap());
+                    }
+                });
             }
         });
+        if let Some(index) = coupling_change {
+            self.update_coupling(index);
+            self.fit_vertical();
+            ui.ctx().request_repaint();
+        }
         if changed {
             self.reset();
         }
     }
 
-    pub fn show(&mut self, ui: &mut Ui) {
+    pub fn show(&mut self, ui: &mut Ui) -> Option<String> {
         let (response, p) = ui.allocate_painter(
             ui.available_size().max(vec2(1., 1.)),
             Sense::click_and_drag(),
@@ -367,7 +576,7 @@ impl Plot {
             outer.max - vec2(if mixed { 64. } else { 24. }, 26.),
         );
         if r.width() < 20. || r.height() < 20. {
-            return;
+            return None;
         }
         use egui::PointerButton::{Middle, Primary, Secondary};
         if response.dragged_by(Middle) || response.dragged_by(Secondary) {
@@ -387,6 +596,34 @@ impl Plot {
                 .map(|(anchor, end)| {
                     Rect::from_two_pos(anchor.clamp(r.min, r.max), end.clamp(r.min, r.max))
                 });
+        if let Some(selected) = zoom_box {
+            let fraction = f64::from(selected.height() / r.height());
+            let (start, end) = (
+                self.x.at((selected.left() - r.left()) / r.width()),
+                self.x.at((selected.right() - r.left()) / r.width()),
+            );
+            let ac = self.wave.analysis == crate::analysis::Analysis::Ac;
+            let delta_x = if self.wave.logarithmic_frequency {
+                10_f64.powf(end) - 10_f64.powf(start)
+            } else {
+                end - start
+            };
+            let delta_y = if mixed {
+                format!(
+                    "{} / {}",
+                    measurement_value(self.y.span * fraction, "V"),
+                    measurement_value(self.current.span * fraction, "A")
+                )
+            } else if current_visible {
+                measurement_value(self.current.span * fraction, "A")
+            } else {
+                measurement_value(self.y.span * fraction, "V")
+            };
+            self.selection_delta = Some(format!(
+                "Δx {}    Δy {delta_y}",
+                measurement_value(delta_x, if ac { "Hz" } else { "s" }),
+            ));
+        }
         if response.drag_stopped_by(Primary) {
             self.zoom_anchor = None;
             if let Some(selected) =
@@ -419,14 +656,7 @@ impl Plot {
                 self.current.zoom(anchor, zoom);
             }
         }
-        let mut fit = response.double_clicked();
-        response.context_menu(|ui| {
-            if ui.button("Zoom to Fit").clicked() {
-                fit = true;
-                ui.close();
-            }
-        });
-        if fit {
+        if response.double_clicked() {
             self.reset();
         }
         let font = FontId::proportional(11.);
@@ -585,14 +815,22 @@ impl Plot {
                     .map(|&j| {
                         pos2(
                             r.left() + r.width() * self.x.fraction(self.wave.time[j]),
-                            r.bottom() - r.height() * range.fraction(trace.samples[j]),
+                            r.bottom()
+                                - r.height() * range.fraction(trace.samples[j] - display.dc_offset),
                         )
                     })
                     .collect();
                 (i, points)
             })
             .collect();
-        let hovered = cursor.and_then(|pos| {
+        let hit_position = if response.secondary_clicked() {
+            response
+                .interact_pointer_pos()
+                .filter(|pos| r.contains(*pos))
+        } else {
+            cursor
+        };
+        let hovered = hit_position.and_then(|pos| {
             paths
                 .iter()
                 .filter_map(|(i, points)| {
@@ -620,6 +858,55 @@ impl Plot {
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(i, _)| i)
         });
+        if response.secondary_clicked() {
+            self.menu_trace = hovered;
+        }
+        let (mut reset_x, mut reset_y) = (false, false);
+        let mut coupling_change = None;
+        egui::Popup::context_menu(&response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                if let Some(index) = self.menu_trace {
+                    let trace = &self.wave.traces[index];
+                    if self
+                        .measurements
+                        .entry(trace.name.to_ascii_lowercase())
+                        .or_default()
+                        .menu(
+                            ui,
+                            trace,
+                            self.wave.analysis == crate::analysis::Analysis::Transient,
+                        )
+                    {
+                        coupling_change = Some(index);
+                    }
+                    ui.separator();
+                }
+                for (label, x, y) in [
+                    ("Zoom to Fit", true, true),
+                    ("Reset X Axis", true, false),
+                    ("Reset Y Axis", false, true),
+                ] {
+                    if ui.button(label).clicked() {
+                        (reset_x, reset_y) = (x, y);
+                        ui.close();
+                    }
+                }
+            });
+        if reset_x || reset_y || coupling_change.is_some() {
+            if let Some(index) = coupling_change {
+                self.update_coupling(index);
+            }
+            if reset_x {
+                self.fit_horizontal();
+            }
+            if reset_y || coupling_change.is_some() {
+                self.fit_vertical();
+            }
+            self.selection_delta = None;
+            ui.ctx().request_repaint();
+            return None;
+        }
         if let Some(i) = hovered
             && !ui.ctx().text_edit_focused()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
@@ -627,7 +914,7 @@ impl Plot {
             self.visible[i] = false;
             self.fit_vertical();
             ui.ctx().request_repaint();
-            return;
+            return None;
         }
         for (i, points) in paths {
             let color = COLORS[i % COLORS.len()];
@@ -651,6 +938,13 @@ impl Plot {
                 egui::StrokeKind::Inside,
             );
         }
+        if let Some(label) = &self.selection_delta {
+            let text = graph.layout_no_wrap(label.clone(), font.clone(), LABEL);
+            let pos = r.left_bottom() + vec2(8., -8. - text.size().y);
+            graph.rect_filled(Rect::from_min_size(pos, text.size()).expand(4.), 2, BACK);
+            graph.galley(pos, text, LABEL);
+        }
+        let mut current_hover = None;
         if let Some(pos) = cursor {
             let t = self.x.at((pos.x - r.left()) / r.width());
             let after = self.wave.time.partition_point(|&sample| sample < t);
@@ -674,7 +968,9 @@ impl Plot {
             for (channel, trace) in self.wave.traces.iter().enumerate() {
                 if self.visible[channel] {
                     let y = r.bottom()
-                        - r.height() * trace_range(trace.quantity).fraction(trace.samples[i]);
+                        - r.height()
+                            * trace_range(trace.quantity)
+                                .fraction(trace.samples[i] - self.displays[channel].dc_offset);
                     graph.circle_stroke(
                         pos2(x, y),
                         3.5,
@@ -682,13 +978,27 @@ impl Plot {
                     );
                 }
             }
+            if let Some(channel) = hovered {
+                let trace = &self.wave.traces[channel];
+                if trace.quantity == Quantity::Current
+                    && crate::waveform::current_trace(&trace.name).is_some()
+                {
+                    current_hover = Some(trace.name.clone());
+                }
+            }
             self.sample = Some(i);
         }
         if let Some(i) = self.sample {
             let mut label = format!("x  {}", axis_label(self.wave.time[i]));
-            for (trace, &visible) in self.wave.traces.iter().zip(&self.visible) {
+            for ((trace, &visible), display) in self
+                .wave
+                .traces
+                .iter()
+                .zip(&self.visible)
+                .zip(&self.displays)
+            {
                 if visible {
-                    let value = trace.samples[i];
+                    let value = trace.samples[i] - display.dc_offset;
                     let (factor, unit) =
                         scale(trace_range(trace.quantity).span / 8., trace.quantity.unit());
                     label.push_str(&format!(
@@ -710,7 +1020,59 @@ impl Plot {
             );
             graph.galley(pos, text, LABEL);
         }
+        current_hover
     }
+}
+
+fn measurement_value(value: f64, unit: &str) -> String {
+    let (factor, unit) = if value == 0. {
+        (1., unit.into())
+    } else {
+        scale(value.abs(), unit)
+    };
+    format!(
+        "{} {unit}",
+        format_tick(value * factor, (value * factor).abs().max(0.01))
+    )
+}
+
+fn measure_trace(wave: &Waveform, trace: &Trace, offset: f64) -> [f64; 5] {
+    let first = trace.samples[0] - offset;
+    let (min, max, sum, squares) = trace.samples.iter().fold(
+        (first, first, 0., 0.),
+        |(min, max, sum, squares), &value| {
+            let value = value - offset;
+            (
+                min.min(value),
+                max.max(value),
+                sum + value,
+                squares + value * value,
+            )
+        },
+    );
+    let count = trace.samples.len() as f64;
+    let mut mean = sum / count;
+    let mut rms = (squares / count).sqrt();
+    if wave.analysis == crate::analysis::Analysis::Transient {
+        let duration = wave.time.last().unwrap() - wave.time[0];
+        if duration > 0. {
+            // Integrate the displayed piecewise-linear waveform over time.
+            let (area, energy) = wave.time.windows(2).zip(trace.samples.windows(2)).fold(
+                (0., 0.),
+                |(area, energy), (t, v)| {
+                    let weight = (t[1] - t[0]) / duration;
+                    let (a, b) = (v[0] - offset, v[1] - offset);
+                    (
+                        area + weight * (a + b) / 2.,
+                        energy + weight * (a * a + a * b + b * b) / 3.,
+                    )
+                },
+            );
+            mean = area;
+            rms = energy.sqrt();
+        }
+    }
+    [max - min, rms, mean, min, max]
 }
 
 fn format_tick(value: f64, span: f64) -> String {
@@ -746,6 +1108,102 @@ fn scale(span: f64, unit: &str) -> (f64, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reversed_current_replaces_the_original_and_survives_refresh() {
+        let wave = |value| Waveform {
+            analysis: crate::analysis::Analysis::Transient,
+            logarithmic_frequency: false,
+            time: vec![0., 1.],
+            traces: vec![Trace {
+                name: "I(r1)".into(),
+                quantity: Quantity::Current,
+                samples: vec![value; 2],
+                phasors: None,
+            }],
+        };
+        let mut plot = Plot::new(wave(2.));
+        assert!(plot.probe("I(r1)", false));
+        assert!(plot.probe("-I(r1)", false));
+        assert_eq!(plot.visible, [false, true]);
+        assert_eq!(plot.wave.traces[1].samples, [-2., -2.]);
+        plot.refresh(wave(3.));
+        assert_eq!(plot.visible, [false, true]);
+        assert_eq!(plot.wave.traces[1].samples, [-3., -3.]);
+        assert!(plot.probe("I(r1)", false));
+        assert_eq!(plot.visible, [true, false]);
+    }
+
+    #[test]
+    fn axis_fits_are_independent_and_coupling_survives_refresh() {
+        let wave = |offset| Waveform {
+            analysis: crate::analysis::Analysis::Transient,
+            logarithmic_frequency: false,
+            time: vec![0., 1.],
+            traces: [("V(a)", offset), ("V(b)", 20.)]
+                .map(|(name, dc)| Trace {
+                    name: name.into(),
+                    quantity: Quantity::Voltage,
+                    samples: vec![dc - 1., dc + 1.],
+                    phasors: None,
+                })
+                .into(),
+        };
+        let mut plot = Plot::new(wave(5.));
+        assert!(plot.probe("V(a)", false));
+        assert!(plot.probe("V(b)", false));
+        let fitted = plot.x;
+        plot.x.zoom(0.5, 2.);
+        plot.y.zoom(0.5, 2.);
+        let zoomed_y = plot.y;
+        plot.fit_horizontal();
+        assert!(plot.x == fitted);
+        assert!(plot.y == zoomed_y);
+        plot.x.zoom(0.5, 2.);
+        let zoomed_x = plot.x;
+        plot.fit_vertical();
+        assert!(plot.x == zoomed_x);
+        assert!(plot.y != zoomed_y);
+
+        plot.measurements
+            .entry("v(a)".into())
+            .or_default()
+            .ac_coupled = true;
+        plot.update_coupling(0);
+        assert_eq!(plot.displays[0].dc_offset, 5.);
+        assert_eq!(plot.displays[1].dc_offset, 0.);
+        assert_eq!(
+            measure_trace(&plot.wave, &plot.wave.traces[0], plot.displays[0].dc_offset)[2],
+            0.
+        );
+        plot.refresh(wave(10.));
+        assert_eq!(plot.displays[0].dc_offset, 10.);
+        assert_eq!(plot.displays[1].dc_offset, 0.);
+    }
+
+    #[test]
+    fn differential_ac_trace_subtracts_phasors_and_survives_refresh() {
+        let wave = || Waveform {
+            analysis: crate::analysis::Analysis::Ac,
+            logarithmic_frequency: false,
+            time: vec![100., 200.],
+            traces: [("V(a)", 1.), ("V(b)", -1.)]
+                .map(|(name, real)| Trace {
+                    name: name.into(),
+                    quantity: Quantity::Voltage,
+                    samples: vec![1., 1.],
+                    phasors: Some(vec![(real, 0.); 2]),
+                })
+                .into(),
+        };
+        let mut plot = Plot::new(wave());
+        assert!(plot.probe("V(a,b)", false));
+        let index = plot.trace_index("V(a,b)").unwrap();
+        assert_eq!(plot.wave.traces[index].samples, [2., 2.]);
+        plot.refresh(wave());
+        assert!(plot.visible[index]);
+        assert_eq!(plot.wave.traces[index].samples, [2., 2.]);
+    }
 
     #[test]
     fn dense_display_preserves_column_peaks_and_restores_raw_points_on_zoom() {

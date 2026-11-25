@@ -100,6 +100,50 @@ mod tests {
 
     #[test]
     #[ignore = "requires ngspice on PATH"]
+    fn transistor_parameters_apply_per_instance() {
+        let library = include_str!("../assets/components.lib");
+        for (kind, supply, bias, parameter) in [
+            ("npn", 5., 0.65, "is=2e-16"),
+            ("pnp", -5., -0.65, "is=2e-16"),
+            ("nmos", 5., 3., "kp=2m"),
+            ("pmos", -5., -3., "kp=2m"),
+            ("njfet", 5., 0., "beta=2m"),
+            ("pjfet", -5., 0., "vto=-2"),
+        ] {
+            let deck = format!(
+                "Transistor parameters
+V1 d 0 {supply}
+V2 g 0 {bias}
+                 X1 d g 0 os_{kind}
+X2 d g 0 os_{kind}_adjust
+                 X3 d g 0 os_{kind}_adjust {parameter}
+{library}
+.op
+.end"
+            );
+            let run = simulate(&deck);
+            let wave = run.waveform.expect(&run.log);
+            let current = |name| {
+                wave.traces
+                    .iter()
+                    .find(|trace| trace.name == name)
+                    .unwrap()
+                    .samples[0]
+            };
+            let default = current("I(x1)");
+            if kind == "pjfet" {
+                assert!((current("I(x2)") - default).abs() < 1e-12);
+                assert!(current("I(x3)").abs() > 1e-3);
+                continue;
+            }
+            assert!(default.abs() > 1e-9, "{kind}");
+            assert!((current("I(x2)") / default - 1.).abs() < 1e-6, "{kind}");
+            assert!((current("I(x3)") / default - 2.).abs() < 0.01, "{kind}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ngspice on PATH"]
     fn single_pole_bandwidth_and_slew() {
         let library = include_str!("../assets/components.lib");
         let ac = format!(

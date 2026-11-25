@@ -10,10 +10,17 @@ I started OpenSpice as an engineering student to make experimenting with circuit
 
 Get the x86-64 builds from [GitHub Releases](https://github.com/Jockkoo/OpenSpice/releases). Open a release and look under **Assets** for the package for your platform.
 
-- **Arch Linux:** Download the `.pkg.tar.zst` file and install it from your downloads directory with `sudo pacman -U ./openspice-0.1.1-1-x86_64.pkg.tar.zst`. Substitute the filename you downloaded if the version differs. Launch OpenSpice from your application menu or run `openspice`.
+- **Arch Linux:** Install the package with `sudo pacman -U ./openspice-0.2.0-1-x86_64.pkg.tar.zst`.
+- **Ubuntu 24.04 LTS or newer:** Install the package with `sudo apt install ./openspice_0.2.0-1_amd64.deb`. APT installs ngspice and the desktop dependencies from the Ubuntu repositories. Enable Universe if APT cannot find ngspice.
 - **Windows:** Download the Windows ZIP and extract it completely. Run `OpenSpice.exe` and keep the bundled `Spice64` folder beside it so simulations can find ngspice.
 
+Use the filename you downloaded if it differs from the examples. On Linux, launch OpenSpice from the applications menu or run `openspice`.
+
 ## Screenshots
+
+**OpenSpice 0.2.0.** A push-pull MOSFET circuit with center-tapped transformers, differential voltage traces, and per-trace measurements.
+
+![OpenSpice showing a push-pull MOSFET schematic beneath two differential voltage waveforms, with peak-to-peak measurements and a cursor readout](assets/screenshots/0.2.0.png)
 
 **RLC filter.** The schematic and its damped pulse response.
 

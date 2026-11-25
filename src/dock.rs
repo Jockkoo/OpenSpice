@@ -152,15 +152,10 @@ impl Dock {
                 *fraction = ((offset + if rows { delta.y } else { delta.x }) / length)
                     .clamp(limit, 1. - limit);
             }
-            ui.painter().rect_filled(
-                divider,
-                0,
-                Color32::from_gray(if handle.hovered() || handle.dragged() {
-                    115
-                } else {
-                    38
-                }),
-            );
+            if handle.hovered() || handle.dragged() {
+                ui.painter()
+                    .rect_filled(divider.shrink(1.), 2, Color32::from_gray(85));
+            }
             self.pane(ui, first_rect, &[first], true, &mut content);
             self.pane(ui, second_rect, &[first.other()], true, &mut content);
         } else if let Some(view) = self.maximized.filter(|_| has_plot) {
@@ -255,6 +250,14 @@ impl Dock {
                 .max_rect(rect.shrink(6.)),
         );
         pane.set_clip_rect(ui.clip_rect().intersect(rect));
+        let radius = crate::ui::PANE_RADIUS;
+        pane.painter().rect(
+            rect,
+            radius,
+            pane.visuals().window_fill,
+            pane.visuals().window_stroke,
+            StrokeKind::Inside,
+        );
         pane.horizontal(|ui| {
             for &view in tabs {
                 let sense = if has_plot {
@@ -262,8 +265,20 @@ impl Dock {
                 } else {
                     Sense::click()
                 };
-                let mut response =
-                    ui.add(Button::selectable(view == active, view.title()).sense(sense));
+                let title = egui::RichText::new(view.title());
+                let title = if view == active {
+                    title.strong()
+                } else {
+                    title.weak()
+                };
+                let mut response = ui.add(Button::new(title).frame(false).sense(sense));
+                if !single && view == active {
+                    let rect = response.rect.shrink2(egui::vec2(5., 1.));
+                    ui.painter().line_segment(
+                        [rect.left_bottom(), rect.right_bottom()],
+                        Stroke::new(1., ui.visuals().weak_text_color()),
+                    );
+                }
                 if has_plot {
                     response = response
                         .on_hover_cursor(CursorIcon::Grab)
@@ -301,7 +316,7 @@ impl Dock {
                         Sense::click(),
                     );
                     let style = ui.style().interact(&response);
-                    ui.painter().rect_filled(rect, 0, style.bg_fill);
+                    ui.painter().rect_filled(rect, 3, style.bg_fill);
                     for x in [-1., 1.] {
                         for y in [-1., 1.] {
                             let direction = egui::vec2(x, y);
@@ -331,7 +346,7 @@ impl Dock {
                 });
             }
         });
-        pane.separator();
+        pane.add_space(2.);
         // Keep widget IDs tied to the content when it changes dock position.
         pane.scope_builder(
             egui::UiBuilder::new().scope_id(content_scope.with(active.title())),

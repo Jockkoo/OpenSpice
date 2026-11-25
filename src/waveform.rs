@@ -20,6 +20,7 @@ pub struct Trace {
     pub name: String,
     pub quantity: Quantity,
     pub samples: Vec<f64>,
+    pub phasors: Option<Vec<(f64, f64)>>,
 }
 
 #[derive(Debug)]
@@ -28,6 +29,25 @@ pub struct Waveform {
     pub logarithmic_frequency: bool,
     pub time: Vec<f64>,
     pub traces: Vec<Trace>,
+}
+
+pub(crate) fn current_trace(signal: &str) -> Option<(&str, bool)> {
+    let (signal, reversed) = signal
+        .strip_prefix('-')
+        .map_or((signal, false), |name| (name, true));
+    let component = signal
+        .strip_prefix(['I', 'i'])?
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    Some((component, reversed))
+}
+
+pub(crate) fn differential_nodes(signal: &str) -> Option<(&str, &str)> {
+    signal
+        .strip_prefix(['V', 'v'])?
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .split_once(',')
 }
 
 pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
@@ -130,6 +150,8 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
                         .unwrap_or_else(|| name.to_string()),
                     quantity,
                     samples: Vec::with_capacity(n),
+                    phasors: (complex && quantity == Quantity::Voltage)
+                        .then(|| Vec::with_capacity(n)),
                 },
             ))
         })
@@ -185,6 +207,9 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
         time.push(t);
         for (index, trace) in &mut channels {
             let (real, imaginary) = samples[*index];
+            if let Some(phasors) = &mut trace.phasors {
+                phasors.push((real, imaginary));
+            }
             trace
                 .samples
                 .push(if complex { real.hypot(imaginary) } else { real });

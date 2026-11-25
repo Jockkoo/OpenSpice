@@ -43,6 +43,30 @@ J1 d g s mj
 J1 d g s mj
 .model mj PJF(VTO=2 BETA=1m)
 .ends
+.subckt os_npn_adjust c b e params: bf=100 is=1e-16 nf=1 vaf=0 rb=0 rc=0 re=0 cje=0 cjc=0 tf=0
+Q1 c b e mq
+.model mq NPN(BF={bf} IS={is} NF={nf} VAF={vaf} RB={rb} RC={rc} RE={re} CJE={cje} CJC={cjc} TF={tf})
+.ends
+.subckt os_pnp_adjust c b e params: bf=100 is=1e-16 nf=1 vaf=0 rb=0 rc=0 re=0 cje=0 cjc=0 tf=0
+Q1 c b e mq
+.model mq PNP(BF={bf} IS={is} NF={nf} VAF={vaf} RB={rb} RC={rc} RE={re} CJE={cje} CJC={cjc} TF={tf})
+.ends
+.subckt os_nmos_adjust d g s params: vto=1 kp=1m lambda=0 rd=0 rs=0 cgso=0 cgdo=0
+M1 d g s s mm
+.model mm NMOS(VTO={vto} KP={kp} LAMBDA={lambda} RD={rd} RS={rs} CGSO={cgso} CGDO={cgdo})
+.ends
+.subckt os_pmos_adjust d g s params: vto=-1 kp=1m lambda=0 rd=0 rs=0 cgso=0 cgdo=0
+M1 d g s s mm
+.model mm PMOS(VTO={vto} KP={kp} LAMBDA={lambda} RD={rd} RS={rs} CGSO={cgso} CGDO={cgdo})
+.ends
+.subckt os_njfet_adjust d g s params: vto=-2 beta=1m lambda=0 rd=0 rs=0 cgs=0 cgd=0 is=1e-14
+J1 d g s mj
+.model mj NJF(VTO={vto} BETA={beta} LAMBDA={lambda} RD={rd} RS={rs} CGS={cgs} CGD={cgd} IS={is})
+.ends
+.subckt os_pjfet_adjust d g s params: vto=2 beta=1m lambda=0 rd=0 rs=0 cgs=0 cgd=0 is=1e-14
+J1 d g s mj
+.model mj PJF(VTO={vto} BETA={beta} LAMBDA={lambda} RD={rd} RS={rs} CGS={cgs} CGD={cgd} IS={is})
+.ends
 .subckt os_cap p n params: cap=10u
 C1 p n {cap}
 .ends
@@ -65,4 +89,11 @@ B1 out 0 V=min(V(vp),max(V(vn),V(pole)))
 .subckt os_xfmr p1 p2 s1 s2 params: ratio=1
 Esecondary s1 s2 p1 p2 {ratio}
 Fprimary p1 p2 Esecondary {-ratio}
+.ends
+.subckt os_xfmr_ct p1 p2 s1 tap s2 params: ratio=1
+Eupper s1 tap p1 p2 {ratio/2}
+Elower tap s2 p1 p2 {ratio/2}
+Fupper p1 p2 Eupper {-ratio/2}
+Flower p1 p2 Elower {-ratio/2}
+Rtapref tap 0 1T
 .ends
