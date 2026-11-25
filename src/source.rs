@@ -209,7 +209,7 @@ impl Source {
         let mut kind = self.kind;
         ui.label("Source type");
         egui::ComboBox::from_id_salt("source type")
-            .width(crate::ui::DIALOG_FIELD_WIDTH)
+            .width(crate::ui::COMPONENT_FIELD_WIDTH)
             .selected_text(kind.spec().0)
             .show_ui(ui, |ui| {
                 for k in [Kind::Dc, Kind::Sine, Kind::Pulse, Kind::Exp, Kind::Custom] {
@@ -230,15 +230,15 @@ impl Source {
             } else {
                 (*label).into()
             };
-            crate::ui::dialog_field(ui, &label, field);
+            crate::ui::component_field(ui, &label, field);
         }
         let magnitude = if current {
             "AC magnitude (A)"
         } else {
             "AC magnitude (V)"
         };
-        crate::ui::dialog_field(ui, magnitude, &mut self.ac);
-        crate::ui::dialog_field(ui, "AC phase (°)", &mut self.phase);
+        crate::ui::component_field(ui, magnitude, &mut self.ac);
+        crate::ui::component_field(ui, "AC phase (°)", &mut self.phase);
     }
 }
 

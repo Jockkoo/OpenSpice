@@ -67,7 +67,7 @@ const FIELD: Color32 = Color32::from_rgb(26, 27, 30);
 const HOVER: Color32 = Color32::from_rgb(52, 56, 63);
 const CYAN: Color32 = Color32::from_rgb(143, 183, 207);
 const ACTIVE_TOOL: Color32 = Color32::from_rgb(56, 70, 84);
-pub(crate) const TOOL_SIZE: egui::Vec2 = egui::vec2(36., 36.);
+pub(crate) const TOOL_SIZE: egui::Vec2 = egui::vec2(32., 32.);
 
 pub(crate) const DIALOG_FIELD_WIDTH: f32 = 140.;
 
@@ -152,6 +152,19 @@ pub(crate) fn dialog_field(ui: &mut Ui, label: &str, value: &mut String) {
         egui::TextEdit::singleline(value)
             .desired_width(DIALOG_FIELD_WIDTH)
             .margin(egui::Margin::symmetric(6, 3)),
+    );
+    ui.end_row();
+}
+
+pub(crate) const COMPONENT_FIELD_WIDTH: f32 = 175.;
+
+pub(crate) fn component_field(ui: &mut Ui, label: &str, value: &mut String) {
+    ui.add_sized([112., 28.], egui::Label::new(label).wrap());
+    ui.add(
+        TextEdit::singleline(value)
+            .desired_width(COMPONENT_FIELD_WIDTH)
+            .min_size(egui::vec2(0., 28.))
+            .margin(egui::Margin::symmetric(8, 5)),
     );
     ui.end_row();
 }
@@ -401,33 +414,50 @@ fn draw_icon(p: &egui::Painter, center: egui::Pos2, icon: Icon, color: Color32, 
             for x in [1., 10.] {
                 polygon(
                     &[(x, 1.), (x + 5., 1.), (x + 5., 16.), (x, 16.)],
-                    Color32::from_rgb(245, 191, 86),
-                    Stroke::new(scale, Color32::from_rgb(163, 110, 48)),
+                    Color32::from_rgb(255, 211, 98),
+                    Stroke::new(scale, Color32::from_rgb(186, 128, 50)),
                 );
                 p.line_segment(
                     [point(x + 1., 3.), point(x + 4., 3.)],
-                    Stroke::new(scale, Color32::LIGHT_YELLOW),
+                    Stroke::new(scale, Color32::from_rgb(255, 244, 183)),
                 );
             }
         }
         Icon::Stop => {
+            let outline = [
+                (4., 0.),
+                (12., 0.),
+                (16., 4.),
+                (16., 12.),
+                (12., 16.),
+                (4., 16.),
+                (0., 12.),
+                (0., 4.),
+            ];
             polygon(
-                &[
-                    (4., 0.),
-                    (12., 0.),
-                    (16., 4.),
-                    (16., 12.),
-                    (12., 16.),
-                    (4., 16.),
-                    (0., 12.),
-                    (0., 4.),
-                ],
-                Color32::from_rgb(225, 83, 86),
-                Stroke::new(scale, Color32::from_rgb(145, 52, 60)),
+                &outline,
+                Color32::from_rgb(219, 64, 75),
+                Stroke::new(0.9 * scale, Color32::from_rgb(125, 36, 48)),
             );
-            p.line_segment(
-                [point(4., 3.), point(12., 3.)],
-                Stroke::new(scale, Color32::LIGHT_RED),
+            for (edge, color) in [
+                (
+                    &[(2., 6.), (2., 4.8), (4.8, 2.), (11.2, 2.), (14., 4.8)][..],
+                    Color32::from_rgb(255, 153, 150),
+                ),
+                (
+                    &[(14., 10.), (14., 11.2), (11.2, 14.), (4.8, 14.)][..],
+                    Color32::from_rgb(174, 42, 58),
+                ),
+            ] {
+                p.add(egui::Shape::line(
+                    edge.iter().map(|&(x, y)| point(x, y)).collect(),
+                    Stroke::new(0.9 * scale, color),
+                ));
+            }
+            p.rect_filled(
+                egui::Rect::from_min_max(point(5., 5.), point(11., 11.)),
+                0.8,
+                Color32::from_rgb(255, 236, 231),
             );
         }
         Icon::Run => {
@@ -1446,7 +1476,10 @@ impl Workbench {
                 }
             });
 
-            let zoom_width = ui.available_width().max(164.);
+            if ui.available_width() < 154. {
+                ui.end_row();
+            }
+            let zoom_width = ui.available_width();
             ui.allocate_ui_with_layout(
                 egui::vec2(zoom_width, TOOL_SIZE.y),
                 Layout::right_to_left(egui::Align::Center),
@@ -1592,8 +1625,8 @@ impl Workbench {
                         .inner_margin(egui::Margin {
                             left: 8,
                             right: 8,
-                            top: 16,
-                            bottom: 3,
+                            top: 14,
+                            bottom: 1,
                         })
                         .stroke(egui::Stroke::new(1., CHROME_EDGE)),
                 )
@@ -1697,7 +1730,7 @@ impl Workbench {
             Panel::right("component editor")
                 .resizable(true)
                 .default_size(350.)
-                .min_size(300.)
+                .min_size(325.)
                 .frame(pane_frame)
                 .show(ui, |ui| {
                     if self.schematic.selector_open {

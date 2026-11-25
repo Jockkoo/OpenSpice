@@ -1365,7 +1365,7 @@ impl Schematic {
         }
         chosen |= self.transistor_picker(ui, "BJT", [Part::Npn, Part::Pnp]);
         chosen |= self.transistor_picker(ui, "MOSFET", [Part::Nmos, Part::Pmos]);
-        let (_, rect) = ui.allocate_space(crate::ui::TOOL_SIZE + vec2(8., 0.));
+        let (_, rect) = ui.allocate_space(crate::ui::TOOL_SIZE);
         let response = ui.interact(
             rect,
             egui::Id::unique("Choose component"),
@@ -1378,8 +1378,8 @@ impl Schematic {
         if response.clicked() {
             self.selector_open = !self.selector_open;
         }
-        let color = crate::ui::toolbar_surface(ui, &response, self.selector_open);
-        let center = rect.center() - vec2(4., 0.);
+        crate::ui::toolbar_surface(ui, &response, self.selector_open);
+        let center = rect.center();
         let pen = Stroke::new(1.7, ink);
         ui.painter().rect_stroke(
             egui::Rect::from_center_size(center, vec2(15., 22.)),
@@ -1404,12 +1404,6 @@ impl Schematic {
                 );
             }
         }
-        icon_path(
-            ui.painter(),
-            rect.right_center() - vec2(7., 0.),
-            Stroke::new(1.2, color),
-            &[(-3., -1.), (0., 2.), (3., -1.)],
-        );
         chosen
     }
 
@@ -1420,17 +1414,35 @@ impl Schematic {
                 self.selector_open = false;
             }
         });
-        ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search components"));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .hint_text("Search components")
+                .font(FontId::proportional(15.))
+                .desired_width(f32::INFINITY)
+                .min_size(vec2(0., 34.))
+                .margin(egui::Margin::symmetric(10, 6)),
+        );
         let query = self.search.trim().to_lowercase();
-        let height = (ui.available_height() - 96.).max(24.);
+        let available = ui.available_height();
+        let preview_height = (available * 0.5).clamp(56., 184.);
+        let height = (available - preview_height - 12.).max(24.);
+        let parts = || {
+            Part::ALL
+                .into_iter()
+                .chain(Part::LIBRARY)
+                .filter(|part| part.spec().1.to_lowercase().contains(&query))
+        };
+        if self
+            .preview_part
+            .is_none_or(|part| !parts().any(|candidate| candidate == part))
+        {
+            self.preview_part = parts().next();
+        }
         egui::ScrollArea::vertical()
             .max_height(height)
             .show(ui, |ui| {
-                for part in Part::ALL.into_iter().chain(Part::LIBRARY) {
+                for part in parts() {
                     let label = part.spec().1;
-                    if !label.to_lowercase().contains(&query) {
-                        continue;
-                    }
                     let row = ui.add(
                         egui::Button::selectable(self.preview_part == Some(part), label)
                             .sense(egui::Sense::click_and_drag()),
@@ -1450,19 +1462,42 @@ impl Schematic {
                 }
             });
         ui.separator();
-        let (rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), 86.), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            vec2(ui.available_width(), preview_height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter().with_clip_rect(rect);
+        let (paper, _, ink, _, _) = self.canvas_colors();
+        painter.rect_filled(rect, 0, paper);
+        let center = rect.center();
         if let Some(part) = self.preview_part {
+            let mut extent = vec2(GRID, GRID);
+            for (x, y) in part.terminals((0, 0), 0) {
+                extent.x = extent.x.max(x.abs() as f32 * GRID);
+                extent.y = extent.y.max(y.abs() as f32 * GRID);
+            }
+            let scale = ((rect.width() - 24.) / (2. * extent.x))
+                .min((rect.height() - 20.) / (2. * extent.y))
+                .clamp(0.15, 2.5);
+            self.draw_grid(&painter, rect, center, GRID * scale);
             draw(
-                ui.painter(),
-                rect.center(),
-                (part, ""),
+                &painter,
+                center,
+                (part, part.spec().2),
                 0,
-                0.78,
+                scale,
                 self.american_resistor,
-                (self.toolbar_colors().1, Color32::TRANSPARENT),
+                (ink, paper),
             );
+        } else {
+            self.draw_grid(&painter, rect, center, GRID);
         }
+        ui.painter().rect_stroke(
+            rect,
+            0,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
     }
     fn begin_placement(&mut self, part: Part, dragging: bool) {
         self.cancel();
@@ -1551,10 +1586,12 @@ impl Schematic {
             ui.separator();
             let height = (ui.available_height() - 44.).max(24.);
             let valid = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                    ui.spacing_mut().interact_size.y = 28.;
                     egui::Grid::new("component fields")
-                        .min_col_width(132.)
+                        .min_col_width(112.)
+                        .spacing(vec2(10., 6.))
                         .show(ui, |ui| {
-                            crate::ui::dialog_field(ui, "Reference", &mut edit.reference);
+                            crate::ui::component_field(ui, "Reference", &mut edit.reference);
                             if let Some(source) = &mut edit.source {
                                 source.show(ui, edit.original.starts_with(['I', 'i']));
                                 edit.value = source.definition();
@@ -1572,6 +1609,7 @@ impl Schematic {
                                 if !ideal {
                                     ui.label("Diode type");
                                     egui::ComboBox::from_id_salt("diode type")
+                                        .width(crate::ui::COMPONENT_FIELD_WIDTH)
                                         .selected_text(diode_type(kind).1).show_ui(ui, |ui| {
                                             for (model, label) in DIODES { ui.selectable_value(&mut kind, model, label); }
                                         });
@@ -1586,7 +1624,7 @@ impl Schematic {
                                         .find(|(k,_)| *k == key && (original == model || original == "os_diode_ideal" && ideal))
                                         .map_or(default, |(_,v)| v).to_owned();
                                     let label = match key { "vf" => "Forward drop (V)", "ron" => "On resistance (Ω)", "roff" => "Off resistance (Ω)", "bv" => "Breakdown voltage (V)", _ => key };
-                                    crate::ui::dialog_field(ui, label, &mut v);
+                                    crate::ui::component_field(ui, label, &mut v);
                                     definition.push_str(&format!(" {key}={v}"));
                                 }
                                 edit.value = definition;
@@ -1597,7 +1635,7 @@ impl Schematic {
                                 for ((_, label), v) in
                                     edit.part.parameters().iter().zip(&mut edit.parameters)
                                 {
-                                    crate::ui::dialog_field(ui, label, v);
+                                    crate::ui::component_field(ui, label, v);
                                 }
                                 if let Some((inputs, outputs)) = edit.part.transformer_windings() {
                                     let tapped = edit.part == Part::CenterTappedTransformer;
@@ -1625,12 +1663,12 @@ impl Schematic {
                                     }
                                 }
                             } else {
-                                crate::ui::dialog_field(ui, "Value", &mut edit.value);
+                                crate::ui::component_field(ui, "Value", &mut edit.value);
                             }
                             for ((_, label), value) in
                                 parasitic_fields(edit.part).iter().zip(&mut edit.parasitics)
                             {
-                                crate::ui::dialog_field(ui, label, value);
+                                crate::ui::component_field(ui, label, value);
                             }
                         });
                     let valid_name = edit.reference.starts_with(|c: char| {
