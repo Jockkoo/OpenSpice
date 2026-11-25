@@ -1,4 +1,4 @@
-//! Native-endian ngspice binary rawfiles.
+//! ngspice rawfiles with binary or ASCII samples.
 use crate::analysis::Analysis;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quantity {
@@ -38,7 +38,7 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
     let mut points = None;
     let mut in_table = false;
     let mut columns = Vec::new();
-    loop {
+    let binary = loop {
         let end = body
             .iter()
             .position(|&b| b == b'\n')
@@ -47,8 +47,11 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
             .map_err(|_| "Invalid rawfile header")?
             .trim();
         body = &body[end + 1..];
-        if line == "Binary:" {
-            break;
+        match line {
+            "Binary:" => break true,
+            "Values:" => break false,
+            "" => continue,
+            _ => {}
         }
         if in_table {
             let mut fields = line.split_whitespace();
@@ -76,7 +79,7 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
                 _ => {}
             }
         }
-    }
+    };
     let analysis = analysis.ok_or("Unsupported analysis in rawfile")?;
     let complex = analysis == Analysis::Ac;
     if !flags
@@ -95,9 +98,19 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
     }
     let stride = if complex { 16 } else { 8 };
     let width = columns.len() * stride;
-    if n.checked_mul(width) != Some(body.len()) {
+    if binary && n.checked_mul(width) != Some(body.len()) {
         return Err("Unexpected rawfile size. Select one analysis per run.".into());
     }
+    let mut ascii = if binary {
+        None
+    } else {
+        let values = std::str::from_utf8(body).map_err(|_| "Invalid ASCII rawfile data")?;
+        let fields = values.split_ascii_whitespace();
+        if n.checked_mul(columns.len() + 1) != Some(fields.clone().count()) {
+            return Err("Unexpected rawfile size. Select one analysis per run.".into());
+        }
+        Some(fields)
+    };
     let mut channels: Vec<_> = columns
         .iter()
         .enumerate()
@@ -125,33 +138,56 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
         return Err("No voltage or current traces were saved".into());
     }
     let mut time = Vec::with_capacity(n);
-    for row in body.chunks_exact(width) {
-        // ngspice writes doubles in the local machine's byte order.
-        let sample = |column: usize| -> Result<f64, String> {
-            let value = f64::from_ne_bytes(row[column..column + 8].try_into().unwrap());
-            if value.is_finite() {
-                Ok(value)
-            } else {
-                Err("Non-finite waveform sample".into())
+    let mut samples = vec![(0., 0.); columns.len()];
+    for point in 0..n {
+        if let Some(fields) = &mut ascii {
+            if fields.next().and_then(|index| index.parse().ok()) != Some(point) {
+                return Err("Invalid sample index in rawfile".into());
             }
-        };
+            for sample in &mut samples {
+                let field = fields.next().ok_or("Missing waveform sample")?;
+                let (real, imaginary) = if complex {
+                    field.split_once(',').ok_or("Missing imaginary sample")?
+                } else {
+                    (field, "0")
+                };
+                *sample = (
+                    real.parse().map_err(|_| "Invalid waveform sample")?,
+                    imaginary.parse().map_err(|_| "Invalid waveform sample")?,
+                );
+            }
+        } else {
+            let row = &body[point * width..][..width];
+            // ngspice writes doubles in the local machine's byte order.
+            let double = |offset| f64::from_ne_bytes(row[offset..offset + 8].try_into().unwrap());
+            for (column, sample) in samples.iter_mut().enumerate() {
+                let offset = column * stride;
+                *sample = (
+                    double(offset),
+                    if complex { double(offset + 8) } else { 0. },
+                );
+            }
+        }
+        if samples
+            .iter()
+            .any(|(real, imaginary)| !real.is_finite() || !imaginary.is_finite())
+        {
+            return Err("Non-finite waveform sample".into());
+        }
         let t = if analysis == Analysis::Op {
             0.
         } else {
-            sample(0)?
+            samples[0].0
         };
         if time.last().is_some_and(|prev| *prev > t) {
             return Err("Time vector is out of order".into());
         }
         time.push(t);
         for (index, trace) in &mut channels {
-            let at = *index * stride;
-            let real = sample(at)?;
-            trace.samples.push(if complex {
-                real.hypot(sample(at + 8)?)
-            } else {
-                real
-            });
+            let (real, imaginary) = samples[*index];
+            trace
+                .samples
+                .push(if complex { real.hypot(imaginary) } else { real });
         }
     }
     Ok(Waveform {

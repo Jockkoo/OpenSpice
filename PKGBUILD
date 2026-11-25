@@ -1,6 +1,6 @@
 # Run makepkg from the OpenSpice checkout.
 pkgname=openspice
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Native circuit schematic editor and ngspice simulator'
 arch=('x86_64')
