@@ -1,0 +1,8 @@
+RC low-pass step response
+* R1 x C1 = 1 ms
+V1 in 0 PULSE(0 5 1m 1u 1u 5m 10m)
+R1 in out 1k
+C1 out 0 1u
+
+.tran 10u 21m
+.end

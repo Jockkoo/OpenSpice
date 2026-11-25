@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenSpice
+Comment=SPICE circuit simulator
+Exec=openspice
+Icon=openspice
+Terminal=false
+Categories=Education;Science;Electronics;
+StartupWMClass=openspice

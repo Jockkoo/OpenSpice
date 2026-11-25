@@ -1,0 +1,7 @@
+RLC low-pass pulse response
+V1 in 0 PULSE(0 5 1m 1u 1u 5m 10m) AC 1
+R1 in mid 47
+L1 mid out 10m
+C1 out 0 1u
+.tran 5u 21m
+.end

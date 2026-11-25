@@ -1,0 +1,68 @@
+* OpenSpice built-in component models
+.subckt os_diode a k
+D1 a k md
+.model md D
+.ends
+.subckt os_rectifier a k
+D1 a k md
+.model md D(IS=7n N=1.8 RS=0.04 CJO=25p TT=2u BV=100 IBV=10u)
+.ends
+.subckt os_schottky a k
+D1 a k md
+.model md D(IS=2u N=1.05 RS=0.08 CJO=80p BV=40 IBV=1m)
+.ends
+.subckt os_zener a k
+D1 a k md
+.model md D(IS=1p N=1.2 RS=2 CJO=80p BV=5.1 IBV=1m)
+.ends
+.subckt os_led a k
+D1 a k md
+.model md D(IS=1e-19 N=2 RS=8 CJO=20p BV=5 IBV=10u)
+.ends
+.subckt os_npn c b e
+Q1 c b e mq
+.model mq NPN(BF=100)
+.ends
+.subckt os_pnp c b e
+Q1 c b e mq
+.model mq PNP(BF=100)
+.ends
+.subckt os_nmos d g s
+M1 d g s s mm
+.model mm NMOS(VTO=1 KP=1m)
+.ends
+.subckt os_pmos d g s
+M1 d g s s mm
+.model mm PMOS(VTO=-1 KP=1m)
+.ends
+.subckt os_njfet d g s
+J1 d g s mj
+.model mj NJF(VTO=-2 BETA=1m)
+.ends
+.subckt os_pjfet d g s
+J1 d g s mj
+.model mj PJF(VTO=2 BETA=1m)
+.ends
+.subckt os_cap p n params: cap=10u
+C1 p n {cap}
+.ends
+.subckt os_op_adjust p n out params: vpos=15 vneg=-15
+B1 out 0 V=min({vpos},max({vneg},1e9*V(p,n)))
+.ends
+.subckt os_oprail p n out vp vn
+B1 out 0 V=min(V(vp),max(V(vn),1e9*V(p,n)))
+.ends
+.subckt os_pole_ext p n out vp vn params: biasp=0 biasn=0 gbw=1meg gain=100k slew=1meg
+Bdrive 0 pole I=min({slew},max(-{slew},6.283185307179586*{gbw}*V(p,n)))
+Cpole pole 0 1
+Rpole pole 0 {gain/(6.283185307179586*gbw)}
+Vpref pref 0 {biasp}
+Vnref nref 0 {biasn}
+Rp vp pref 1T
+Rn vn nref 1T
+B1 out 0 V=min(V(vp),max(V(vn),V(pole)))
+.ends
+.subckt os_xfmr p1 p2 s1 s2 params: ratio=1
+Esecondary s1 s2 p1 p2 {ratio}
+Fprimary p1 p2 Esecondary {-ratio}
+.ends
