@@ -2,7 +2,28 @@
 
 OpenSpice is a native Rust circuit simulator with an editable SPICE netlist and transient waveforms, AC magnitude plots and DC operating-point results. It uses eframe/egui for the desktop window and runs the ngspice batch executable in a background thread.
 
-## Run on Arch Linux
+I started OpenSpice as an engineering student because I wanted a simulator for my coursework and circuit experiments. OpenSpice itself was made entirely with AI. It is for educational use only and is not intended to replace an industrial circuit simulator.
+
+**Work in progress.** Expect bugs, incomplete features, and changes as the project develops.
+
+## Download
+
+Get the x86-64 builds from [GitHub Releases](https://github.com/Jockkoo/OpenSpice/releases). Open a release and look under **Assets** for the package for your platform.
+
+- **Arch Linux:** Download the `.pkg.tar.zst` file and install it from your downloads directory with `sudo pacman -U ./openspice-0.1.0-1-x86_64.pkg.tar.zst`. Substitute the filename you downloaded if the version differs. Launch OpenSpice from your application menu or run `openspice`.
+- **Windows:** Download the Windows ZIP and extract it completely. Run `OpenSpice.exe` and keep the bundled `Spice64` folder beside it so simulations can find ngspice.
+
+## Screenshots
+
+**RLC filter.** The schematic and its damped pulse response.
+
+![OpenSpice showing an RLC filter schematic and its transient output with overshoot and ringing](assets/screenshots/RLC.png)
+
+**Op amp circuit.** A non-inverting amplifier with input and output waveforms displayed together.
+
+![OpenSpice showing a non-inverting op amp schematic and two sinusoidal voltage traces](assets/screenshots/OP.png)
+
+## Build from source on Arch Linux
 
 Install the build tools, Rust toolchain, simulator, and desktop libraries. An existing current stable Rust toolchain also works in place of the Arch `rust` package.
 
@@ -18,7 +39,7 @@ Run the Cargo command from this project directory in your Wayland or X11 desktop
 1. Launch OpenSpice. The schematic opens with [the bundled example](examples/rlc-low-pass.cir). **Load Example** restores the example.
 2. Click **Run Simulation**. The 0–5 V pulse drives a 47 Ω resistor and 10 mH inductor in series with a 1 µF capacitor to ground. Probe V(out) to see overshoot and damped ringing at each edge.
 3. In Cursor mode, click a wire or junction to show its node voltage, or click a component to show its branch current. Double-click a probe target to show only that signal. Rerun after editing the circuit to probe the updated results.
-4. To remove a trace, hover over its line and press **Delete**, or click its legend entry. Scroll over the plot to zoom around the pointer and drag to pan. Hover over the plot to update the nearest sample in the bottom-right readout. **Reset view** fits the visible traces.
+4. To remove a trace, hover over its line and press **Delete**, or click its legend entry. Scroll to zoom both axes, Ctrl+scroll to zoom horizontally, or Ctrl+Shift+scroll to zoom vertically. Left-drag to zoom to a box and middle-drag to pan. Right-click and choose **Zoom to Fit** to fit the visible traces.
 5. Right-click V1 in Cursor mode to choose a different source type and set its parameters. Apply the change and run again. Open **ngspice output** to inspect stdout and stderr. The pane opens automatically on failure.
 
 Use **Configure Simulation** to choose transient, AC, or DC operating point, then **Run** to simulate. For AC analysis set the small-signal magnitude and optional phase in the voltage source properties.
