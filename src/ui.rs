@@ -1446,44 +1446,46 @@ impl Workbench {
                 }
             });
 
-            if ui.available_width() < 164. {
-                ui.end_row();
-            }
-            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                let zoom = format!("{:.0}%", self.schematic.zoom_percent());
-                ui.menu_button(zoom, |ui| {
-                    ui.set_min_width(116.);
-                    for percent in [50., 100., 200.] {
-                        if ui.button(format!("{percent:.0}%")).clicked() {
+            let zoom_width = ui.available_width().max(164.);
+            ui.allocate_ui_with_layout(
+                egui::vec2(zoom_width, TOOL_SIZE.y),
+                Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let zoom = format!("{:.0}%", self.schematic.zoom_percent());
+                    ui.menu_button(zoom, |ui| {
+                        ui.set_min_width(116.);
+                        for percent in [50., 100., 200.] {
+                            if ui.button(format!("{percent:.0}%")).clicked() {
+                                self.dock.reveal_schematic();
+                                self.schematic.set_zoom_percent(percent);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Zoom to fit").clicked() {
                             self.dock.reveal_schematic();
-                            self.schematic.set_zoom_percent(percent);
+                            self.schematic.fit_pending = true;
                             ui.close();
                         }
-                    }
-                    ui.separator();
-                    if ui.button("Zoom to fit").clicked() {
-                        self.dock.reveal_schematic();
-                        self.schematic.fit_pending = true;
-                        ui.close();
-                    }
-                })
-                .response
-                .on_hover_text("Schematic zoom");
-                for (icon, steps, hint) in [
-                    (Icon::Fit, 0., "Zoom schematic to fit"),
-                    (Icon::Plus, 1., "Zoom schematic in"),
-                    (Icon::Minus, -1., "Zoom schematic out"),
-                ] {
-                    if tool(ui, true, icon, false, hint) {
-                        self.dock.reveal_schematic();
-                        if steps == 0. {
-                            self.schematic.fit_pending = true;
-                        } else {
-                            self.schematic.zoom(steps, None);
+                    })
+                    .response
+                    .on_hover_text("Schematic zoom");
+                    for (icon, steps, hint) in [
+                        (Icon::Fit, 0., "Zoom schematic to fit"),
+                        (Icon::Plus, 1., "Zoom schematic in"),
+                        (Icon::Minus, -1., "Zoom schematic out"),
+                    ] {
+                        if tool(ui, true, icon, false, hint) {
+                            self.dock.reveal_schematic();
+                            if steps == 0. {
+                                self.schematic.fit_pending = true;
+                            } else {
+                                self.schematic.zoom(steps, None);
+                            }
                         }
                     }
-                }
-            });
+                },
+            );
         });
     }
 }
@@ -2663,7 +2665,9 @@ mod tests {
         let output = frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, locate(&output, "File"));
         let output = frame(&mut app, &ctx, vec![]);
-        click(&mut app, &ctx, locate(&output, "Load Example"));
+        click(&mut app, &ctx, locate(&output, "Load Examples"));
+        let output = frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, locate(&output, "RLC circuit"));
         assert_eq!(app.netlist, EXAMPLE);
     }
 
@@ -3421,6 +3425,8 @@ mod tests {
                 ],
             );
         }
+        let output = frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, locate(&output, "Edit component"));
         let output = frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, locate(&output, "R1"));
         let output = frame(

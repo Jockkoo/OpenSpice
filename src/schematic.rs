@@ -1431,17 +1431,20 @@ impl Schematic {
                     if !label.to_lowercase().contains(&query) {
                         continue;
                     }
-                    let row = ui.selectable_label(self.preview_part == Some(part), label);
+                    let row = ui.add(
+                        egui::Button::selectable(self.preview_part == Some(part), label)
+                            .sense(egui::Sense::click_and_drag()),
+                    );
                     if row.hovered() {
                         self.preview_part = Some(part);
                     }
-                    if row.clicked() {
+                    if row.clicked() || row.drag_started() {
                         self.preview_part = Some(part);
                         if let Part::CustomTransformer { inputs, outputs } = part {
                             self.cancel();
                             self.transformer_setup = Some((inputs, outputs));
                         } else {
-                            self.begin_placement(part, false);
+                            self.begin_placement(part, row.drag_started());
                         }
                     }
                 }

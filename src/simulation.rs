@@ -65,6 +65,11 @@ fn run(
 ) -> Result<Waveform, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("Cannot create run directory: {e}"))?;
     let (deck, sensors) = crate::schematic::instrument_currents(netlist);
+    // Older documents embed this exact built-in model with floating windings.
+    let deck = deck.replace(
+        ".subckt os_xfmr p1 p2 s1 s2 params: ratio=1\nEsecondary s1 s2 p1 p2 {ratio}\nFprimary p1 p2 Esecondary {-ratio}\n.ends",
+        ".subckt os_xfmr p1 p2 s1 s2 params: ratio=1\nEsecondary s1 s2 p1 p2 {ratio}\nFprimary p1 p2 Esecondary {-ratio}\nRp2ref p2 0 1T\nRs2ref s2 0 1T\n.ends",
+    );
     fs::write(dir.path().join("circuit.cir"), deck)
         .map_err(|e| format!("Cannot write netlist: {e}"))?;
     let output_path = dir.path().join("run.log");
@@ -110,22 +115,34 @@ fn run(
         }
         let transition = paused != (mode == 1);
         if transition {
-            suspend(&child, mode == 1)?;
+            if let Err(error) = suspend(&child, mode == 1) {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    break status;
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
             paused = mode == 1;
         }
-        if (transition || !paused && last.elapsed().as_millis() >= 450)
-            && let Ok(bytes) = fs::read(&raw)
-            && let Ok(mut wave) = crate::waveform::parse_samples(&bytes, true)
-        {
-            let progress = stop_time
-                .zip(wave.time.last())
-                .map_or(0., |(end, t)| (t / end).clamp(0., 1.));
-            normalize(&mut wave, &sensors, netlist);
-            update(
-                progress,
-                (paused || control.live.load(Ordering::Relaxed)).then_some(wave),
-            );
+        if (transition || !paused && last.elapsed().as_millis() >= 450) {
             last = std::time::Instant::now();
+            if !paused && !control.live.load(Ordering::Relaxed) {
+                if let Some(progress) = raw_progress(&raw, stop_time) {
+                    update(progress, None);
+                }
+            } else if let Ok(bytes) = fs::read(&raw)
+                && let Ok(mut wave) = crate::waveform::parse_samples(&bytes, true)
+            {
+                let progress = stop_time
+                    .zip(wave.time.last())
+                    .map_or(0., |(end, t)| (t / end).clamp(0., 1.));
+                normalize(&mut wave, &sensors, netlist);
+                update(
+                    progress,
+                    (paused || control.live.load(Ordering::Relaxed)).then_some(wave),
+                );
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
@@ -159,6 +176,36 @@ fn run(
     }
     normalize(&mut wave, &sensors, netlist);
     Ok(wave)
+}
+
+// Read the last complete transient sample without decoding all earlier traces.
+fn raw_progress(path: &std::path::Path, stop: Option<f64>) -> Option<f64> {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+    let end = stop?;
+    let mut reader = BufReader::new(fs::File::open(path).ok()?);
+    let mut line = String::new();
+    let mut columns = None;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if line.trim() == "Binary:" {
+            break;
+        }
+        if let Some(n) = line.strip_prefix("No. Variables:") {
+            columns = n.trim().parse::<u64>().ok();
+        }
+    }
+    let start = reader.stream_position().ok()?;
+    let stride = columns?.checked_mul(8)?;
+    let rows = (reader.get_ref().metadata().ok()?.len().checked_sub(start)?).checked_div(stride)?;
+    reader
+        .seek(SeekFrom::Start(start + rows.checked_sub(1)? * stride))
+        .ok()?;
+    let mut sample = [0; 8];
+    reader.read_exact(&mut sample).ok()?;
+    Some((f64::from_ne_bytes(sample) / end).clamp(0., 1.))
 }
 
 fn normalize(wave: &mut Waveform, sensors: &[(String, String)], netlist: &str) {
