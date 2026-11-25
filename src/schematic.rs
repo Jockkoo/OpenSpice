@@ -855,6 +855,9 @@ pub struct Schematic {
     pub american_resistor: bool,
     pub light_canvas: bool,
     kinds: HashMap<String, Part>,
+    pub selector_open: bool,
+    search: String,
+    preview_part: Option<Part>,
     editing: Option<Properties>,
     transformer_setup: Option<(u8, u8)>,
     rotations: HashMap<String, u8>,
@@ -1364,8 +1367,8 @@ impl Schematic {
             egui::WidgetInfo::labeled(egui::Role::Button, true, "Choose component")
         });
         let response = response.on_hover_text("Choose a component");
-        let popup = egui::Popup::menu(&response);
-        let color = crate::ui::toolbar_surface(ui, &response, popup.is_open());
+        if response.clicked() { self.selector_open = !self.selector_open; }
+        let color = crate::ui::toolbar_surface(ui, &response, self.selector_open);
         let center = rect.center() - vec2(4., 0.);
         let pen = Stroke::new(1.7, ink);
         ui.painter().rect_stroke(
@@ -1397,33 +1400,37 @@ impl Schematic {
             Stroke::new(1.2, color),
             &[(-3., -1.), (0., 2.), (3., -1.)],
         );
-        popup.show(|ui| {
-            ui.set_min_width(180.);
-            egui::ScrollArea::vertical()
-                .max_height(400.)
-                .show(ui, |ui| {
-                    for part in Part::ALL.into_iter().chain(Part::LIBRARY) {
-                        let (_, label, _) = part.spec();
-                        let r = ui.add_sized(
-                            [ui.available_width(), 24.],
-                            egui::Button::new(label)
-                                .frame_when_inactive(false)
-                                .sense(egui::Sense::click_and_drag()),
-                        );
-                        if r.clicked() || r.drag_started() {
-                            if let Part::CustomTransformer { inputs, outputs } = part {
-                                self.cancel();
-                                self.transformer_setup = Some((inputs, outputs));
-                            } else {
-                                self.begin_placement(part, r.drag_started());
-                            }
-                            chosen = true;
-                            ui.close();
-                        }
-                    }
-                });
-        });
         chosen
+    }
+
+    pub fn component_selector(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Components");
+            if ui.small_button("×").clicked() { self.selector_open = false; }
+        });
+        ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search components"));
+        let query = self.search.trim().to_lowercase();
+        let height = (ui.available_height() - 96.).max(24.);
+        egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+            for part in Part::ALL.into_iter().chain(Part::LIBRARY) {
+                let label = part.spec().1;
+                if !label.to_lowercase().contains(&query) { continue; }
+                let row = ui.selectable_label(self.preview_part == Some(part), label);
+                if row.hovered() { self.preview_part = Some(part); }
+                if row.clicked() {
+                    self.preview_part = Some(part);
+                    if let Part::CustomTransformer { inputs, outputs } = part {
+                        self.cancel();
+                        self.transformer_setup = Some((inputs, outputs));
+                    } else { self.begin_placement(part, false); }
+                }
+            }
+        });
+        ui.separator();
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 86.), egui::Sense::hover());
+        if let Some(part) = self.preview_part {
+            draw(ui.painter(), rect.center(), (part, ""), 0, 0.78, self.american_resistor, (self.toolbar_colors().1, Color32::TRANSPARENT));
+        }
     }
     fn begin_placement(&mut self, part: Part, dragging: bool) {
         self.cancel();

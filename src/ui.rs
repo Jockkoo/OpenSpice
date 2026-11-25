@@ -1564,9 +1564,14 @@ impl Workbench {
                 .frame(pane_frame)
                 .show(ui, |ui| self.directives_editor(ui));
         }
-        if self.schematic.editor_open() {
+        if self.schematic.editor_open() || self.schematic.selector_open {
             Panel::right("component editor").resizable(true).default_size(350.).min_size(300.)
                 .frame(pane_frame).show(ui, |ui| {
+                    if self.schematic.selector_open {
+                        let height = ui.available_height() * if self.schematic.editor_open() { 0.45 } else { 1.0 };
+                        ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| self.schematic.component_selector(ui));
+                        ui.separator();
+                    }
                     if self.schematic.component_editor(ui, &mut self.netlist) { self.commit_edit(); }
                 });
         }
