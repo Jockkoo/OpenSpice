@@ -18,17 +18,7 @@ Use the filename you downloaded if it differs from the examples. On Linux, launc
 
 ## Screenshots
 
-**OpenSpice 0.2.0.** A push-pull MOSFET circuit with center-tapped transformers, differential voltage traces, and per-trace measurements.
-
 ![OpenSpice showing a push-pull MOSFET schematic beneath two differential voltage waveforms, with peak-to-peak measurements and a cursor readout](assets/screenshots/0.2.0.png)
-
-**RLC filter.** The schematic and its damped pulse response.
-
-![OpenSpice showing an RLC filter schematic and its transient output with overshoot and ringing](assets/screenshots/RLC.png)
-
-**Op amp circuit.** A non-inverting amplifier with input and output waveforms displayed together.
-
-![OpenSpice showing a non-inverting op amp schematic and two sinusoidal voltage traces](assets/screenshots/OP.png)
 
 ## Build from source on Arch Linux
 
