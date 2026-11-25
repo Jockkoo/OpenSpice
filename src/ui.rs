@@ -157,7 +157,7 @@ pub(crate) fn dialog_field(ui: &mut Ui, label: &str, value: &mut String) {
 }
 
 pub(crate) const COMPONENT_FIELD_WIDTH: f32 = 175.;
-pub(crate) const COMPONENT_LABEL_WIDTH: f32 = 122.;
+pub(crate) const COMPONENT_LABEL_WIDTH: f32 = 206.;
 
 pub(crate) fn component_field_label(ui: &mut Ui, label: &str) {
     ui.allocate_ui_with_layout(
@@ -1742,8 +1742,8 @@ impl Workbench {
             Panel::right("component editor")
                 .resizable(true)
                 .show_separator_line(false)
-                .default_size(350.)
-                .min_size(345.)
+                .default_size(430.)
+                .min_size(420.)
                 .frame(pane_frame)
                 .show(ui, |ui| {
                     if self.schematic.selector_open {

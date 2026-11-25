@@ -1588,7 +1588,8 @@ impl Schematic {
             let valid = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 28.;
                     egui::Grid::new("component fields")
-                        .min_col_width(crate::ui::COMPONENT_LABEL_WIDTH)
+                        .num_columns(2)
+                        .min_col_width(crate::ui::COMPONENT_FIELD_WIDTH)
                         .spacing(vec2(10., 6.))
                         .show(ui, |ui| {
                             crate::ui::component_field(ui, "Reference", &mut edit.reference);
