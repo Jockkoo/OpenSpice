@@ -470,9 +470,15 @@ fn cards(text: &str) -> Vec<Card<'_>> {
                                             model
                                         };
                                         (*p == Part::Diode
-                                            && DIODES
-                                                .iter()
-                                                .any(|(key, _)| model.trim_end_matches("_adjust").eq_ignore_ascii_case(key) || matches!(model, "os_diode_piecewise" | "os_diode_ideal")))
+                                            && DIODES.iter().any(|(key, _)| {
+                                                model
+                                                    .trim_end_matches("_adjust")
+                                                    .eq_ignore_ascii_case(key)
+                                                    || matches!(
+                                                        model,
+                                                        "os_diode_piecewise" | "os_diode_ideal"
+                                                    )
+                                            }))
                                             || (*p == Part::Op
                                                 && model.eq_ignore_ascii_case("os_op"))
                                             || p.adjustable_transistor_model().is_some_and(|name| {
@@ -856,6 +862,7 @@ pub struct Schematic {
     pub american_resistor: bool,
     pub light_canvas: bool,
     kinds: HashMap<String, Part>,
+    context_part: Option<(String, Point)>,
     pub selector_open: bool,
     search: String,
     preview_part: Option<Part>,
@@ -1368,7 +1375,9 @@ impl Schematic {
             egui::WidgetInfo::labeled(egui::Role::Button, true, "Choose component")
         });
         let response = response.on_hover_text("Choose a component");
-        if response.clicked() { self.selector_open = !self.selector_open; }
+        if response.clicked() {
+            self.selector_open = !self.selector_open;
+        }
         let color = crate::ui::toolbar_surface(ui, &response, self.selector_open);
         let center = rect.center() - vec2(4., 0.);
         let pen = Stroke::new(1.7, ink);
@@ -1407,30 +1416,49 @@ impl Schematic {
     pub fn component_selector(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.heading("Components");
-            if ui.small_button("×").clicked() { self.selector_open = false; }
+            if ui.small_button("×").clicked() {
+                self.selector_open = false;
+            }
         });
         ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search components"));
         let query = self.search.trim().to_lowercase();
         let height = (ui.available_height() - 96.).max(24.);
-        egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
-            for part in Part::ALL.into_iter().chain(Part::LIBRARY) {
-                let label = part.spec().1;
-                if !label.to_lowercase().contains(&query) { continue; }
-                let row = ui.selectable_label(self.preview_part == Some(part), label);
-                if row.hovered() { self.preview_part = Some(part); }
-                if row.clicked() {
-                    self.preview_part = Some(part);
-                    if let Part::CustomTransformer { inputs, outputs } = part {
-                        self.cancel();
-                        self.transformer_setup = Some((inputs, outputs));
-                    } else { self.begin_placement(part, false); }
+        egui::ScrollArea::vertical()
+            .max_height(height)
+            .show(ui, |ui| {
+                for part in Part::ALL.into_iter().chain(Part::LIBRARY) {
+                    let label = part.spec().1;
+                    if !label.to_lowercase().contains(&query) {
+                        continue;
+                    }
+                    let row = ui.selectable_label(self.preview_part == Some(part), label);
+                    if row.hovered() {
+                        self.preview_part = Some(part);
+                    }
+                    if row.clicked() {
+                        self.preview_part = Some(part);
+                        if let Part::CustomTransformer { inputs, outputs } = part {
+                            self.cancel();
+                            self.transformer_setup = Some((inputs, outputs));
+                        } else {
+                            self.begin_placement(part, false);
+                        }
+                    }
                 }
-            }
-        });
+            });
         ui.separator();
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 86.), egui::Sense::hover());
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), 86.), egui::Sense::hover());
         if let Some(part) = self.preview_part {
-            draw(ui.painter(), rect.center(), (part, ""), 0, 0.78, self.american_resistor, (self.toolbar_colors().1, Color32::TRANSPARENT));
+            draw(
+                ui.painter(),
+                rect.center(),
+                (part, ""),
+                0,
+                0.78,
+                self.american_resistor,
+                (self.toolbar_colors().1, Color32::TRANSPARENT),
+            );
         }
     }
     fn begin_placement(&mut self, part: Part, dragging: bool) {
@@ -1510,7 +1538,9 @@ impl Schematic {
         chosen
     }
 
-    pub fn editor_open(&self) -> bool { self.editing.is_some() }
+    pub fn editor_open(&self) -> bool {
+        self.editing.is_some()
+    }
 
     pub fn component_editor(&mut self, ui: &mut Ui, text: &mut String) -> bool {
         if let Some(mut edit) = self.editing.take() {
@@ -1663,10 +1693,12 @@ impl Schematic {
             }).inner;
             ui.separator();
             let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            let apply = ui.horizontal(|ui| {
-                cancel |= ui.button("Cancel").clicked();
-                ui.add_enabled(valid, egui::Button::new("Apply")).clicked()
-            }).inner;
+            let apply = ui
+                .horizontal(|ui| {
+                    cancel |= ui.button("Cancel").clicked();
+                    ui.add_enabled(valid, egui::Button::new("Apply")).clicked()
+                })
+                .inner;
             if apply {
                 if let Some(c) = cards(text).into_iter().find(|c| c.name == edit.original) {
                     if edit.part.spec().0 == 'X' && edit.part != Part::Diode {
@@ -3272,26 +3304,81 @@ impl Schematic {
                 ui.ctx().request_repaint();
                 return deleted;
             }
+            if r.secondary_clicked() {
+                self.context_part = match self.symbol_at(point) {
+                    Some(Object::Part(name)) if self.tool == Tool::Cursor => Some((name, point)),
+                    _ => None,
+                };
+            }
+            let mut requested_editor = None;
+            if let Some((name, anchor)) = self.context_part.clone() {
+                let mut command = None;
+                r.context_menu(|ui| {
+                    for label in [
+                        "Edit component",
+                        "Rotate",
+                        "Mirror horizontally",
+                        "Mirror vertically",
+                        "Move",
+                        "Delete",
+                    ] {
+                        if ui.button(label).clicked() {
+                            command = Some(label);
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some(command) = command {
+                    self.context_part = None;
+                    self.cancel();
+                    self.selected.clear();
+                    self.selected.insert(Object::Part(name.clone()));
+                    match command {
+                        "Edit component" => requested_editor = Some(name),
+                        "Rotate" => changed |= self.change_orientation(OrientationEdit::Rotate),
+                        "Mirror horizontally" => {
+                            changed |= self.change_orientation(OrientationEdit::MirrorHorizontal)
+                        }
+                        "Mirror vertically" => {
+                            changed |= self.change_orientation(OrientationEdit::MirrorVertical)
+                        }
+                        "Move" => {
+                            self.tool = Tool::Move;
+                            self.drag_origin = Some(self.geometry());
+                            self.gesture = Some(Gesture::Move(anchor));
+                        }
+                        "Delete" => return self.delete_objects(text, None),
+                        _ => {}
+                    }
+                }
+            }
             let edit_power =
                 r.secondary_clicked() && self.tool == Tool::Power && hovered_power.is_some();
             if self.new_comment.is_none()
-                && (edit_power
+                && (requested_editor.is_some()
+                    || edit_power
                     || (self.tool == Tool::Cursor
-                        && ((!probe_clicked && r.double_clicked()) || r.secondary_clicked())))
+                        && ((!probe_clicked && r.double_clicked())
+                            || (r.secondary_clicked() && self.context_part.is_none()))))
             {
-                let name = hovered_label.or_else(|| match self.symbol_at(point) {
-                    Some(Object::Part(n)) => {
-                        self.positions.get_key_value(&n).map(|(n, _)| n.as_str())
+                let name = requested_editor.as_deref().or(hovered_label).or_else(|| {
+                    match self.symbol_at(point) {
+                        Some(Object::Part(n)) => {
+                            self.positions.get_key_value(&n).map(|(n, _)| n.as_str())
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 });
-                if let Some(index) = mouse.and_then(comment_at) {
+                if let Some(index) = mouse
+                    .and_then(comment_at)
+                    .filter(|_| requested_editor.is_none())
+                {
                     self.editing_comment = Some(CommentEdit {
                         index,
                         draft: self.comments[index].clone(),
                         focus: true,
                     });
-                } else if let Some(point) = hovered_power {
+                } else if let Some(point) = hovered_power.filter(|_| requested_editor.is_none()) {
                     self.editing_power = Some((
                         point,
                         self.power_voltages

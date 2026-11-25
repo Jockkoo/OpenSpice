@@ -51,6 +51,10 @@ pub(crate) fn differential_nodes(signal: &str) -> Option<(&str, &str)> {
 }
 
 pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
+    parse_samples(bytes, false)
+}
+
+pub(crate) fn parse_samples(bytes: &[u8], partial: bool) -> Result<Waveform, String> {
     let mut body = bytes;
     let mut analysis = None;
     let mut flags = "";
@@ -108,7 +112,7 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
     {
         return Err("Unexpected rawfile encoding".into());
     }
-    let n = points.filter(|&p| p > 0).ok_or("No samples in result")?;
+
     if columns.is_empty()
         || variables != Some(columns.len())
         || (analysis == Analysis::Transient && columns[0].1 != "time")
@@ -118,6 +122,15 @@ pub fn parse_raw(bytes: &[u8]) -> Result<Waveform, String> {
     }
     let stride = if complex { 16 } else { 8 };
     let width = columns.len() * stride;
+    let n = if partial && binary {
+        let n = body.len() / width;
+        body = &body[..n * width];
+        Some(n)
+    } else {
+        points
+    }
+    .filter(|&n| n > 0)
+    .ok_or("No samples in result")?;
     if binary && n.checked_mul(width) != Some(body.len()) {
         return Err("Unexpected rawfile size. Select one analysis per run.".into());
     }

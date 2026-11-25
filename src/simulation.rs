@@ -8,9 +8,25 @@ pub struct Run {
     pub log: String,
 }
 
+#[cfg(test)]
 pub fn simulate(netlist: &str) -> Run {
+    controlled(netlist, &Control::default(), |_, _| {})
+}
+
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[derive(Default)]
+pub struct Control {
+    pub mode: AtomicU8,
+    pub live: AtomicBool,
+}
+
+pub fn controlled(
+    netlist: &str,
+    control: &Control,
+    mut update: impl FnMut(f64, Option<Waveform>),
+) -> Run {
     let mut log = String::new();
-    let waveform = run(netlist, &mut log);
+    let waveform = run(netlist, &mut log, control, &mut update);
     Run { waveform, log }
 }
 
@@ -41,15 +57,25 @@ fn ngspice_command() -> Command {
     Command::new("ngspice")
 }
 
-fn run(netlist: &str, log: &mut String) -> Result<Waveform, String> {
+fn run(
+    netlist: &str,
+    log: &mut String,
+    control: &Control,
+    update: &mut impl FnMut(f64, Option<Waveform>),
+) -> Result<Waveform, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("Cannot create run directory: {e}"))?;
     let (deck, sensors) = crate::schematic::instrument_currents(netlist);
     fs::write(dir.path().join("circuit.cir"), deck)
         .map_err(|e| format!("Cannot write netlist: {e}"))?;
-    let output = ngspice_command()
+    let output_path = dir.path().join("run.log");
+    let output_file = fs::File::create(&output_path).map_err(|e| e.to_string())?;
+    let raw = dir.path().join("wave.raw");
+    let mut child = ngspice_command()
+        .stderr(output_file.try_clone().map_err(|e| e.to_string())?)
+        .stdout(output_file)
         .current_dir(dir.path())
         .args(["-n", "-b", "-r", "wave.raw", "circuit.cir"])
-        .output()
+        .spawn()
         .map_err(|e| match e.kind() {
             ErrorKind::NotFound => {
                 if cfg!(target_os = "windows") {
@@ -60,13 +86,60 @@ fn run(netlist: &str, log: &mut String) -> Result<Waveform, String> {
             }
             _ => format!("Cannot start ngspice: {e}"),
         })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    *log = format!("stdout\n{stdout}\n\nstderr\n{stderr}");
-    if !output.status.success() {
-        return Err(format!("ngspice exited with {}", output.status));
+    let mut paused = false;
+    let mut last = std::time::Instant::now();
+    let mut stopped = false;
+    let stop_time = netlist
+        .lines()
+        .map(str::split_whitespace)
+        .find_map(|mut f| {
+            f.next()?
+                .eq_ignore_ascii_case(".tran")
+                .then(|| crate::analysis::number(f.nth(1)?))
+                .flatten()
+        });
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        let mode = control.mode.load(Ordering::Relaxed);
+        if mode == 2 {
+            stopped = true;
+            let _ = child.kill();
+            break child.wait().map_err(|e| e.to_string())?;
+        }
+        let transition = paused != (mode == 1);
+        if transition {
+            suspend(&child, mode == 1)?;
+            paused = mode == 1;
+        }
+        if (transition || !paused && last.elapsed().as_millis() >= 450)
+            && let Ok(bytes) = fs::read(&raw)
+            && let Ok(mut wave) = crate::waveform::parse_samples(&bytes, true)
+        {
+            let progress = stop_time
+                .zip(wave.time.last())
+                .map_or(0., |(end, t)| (t / end).clamp(0., 1.));
+            normalize(&mut wave, &sensors, netlist);
+            update(
+                progress,
+                (paused || control.live.load(Ordering::Relaxed)).then_some(wave),
+            );
+            last = std::time::Instant::now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    *log = fs::read_to_string(output_path).unwrap_or_default();
+    if stopped {
+        let bytes = fs::read(raw).map_err(|_| "Stopped before the first sample")?;
+        let mut wave = crate::waveform::parse_samples(&bytes, true)?;
+        normalize(&mut wave, &sensors, netlist);
+        return Ok(wave);
     }
-    if stderr.lines().chain(stdout.lines()).any(|line| {
+    if !status.success() {
+        return Err(format!("ngspice exited with {status}"));
+    }
+    if log.lines().any(|line| {
         let line = line.trim().to_ascii_lowercase();
         line.starts_with("error:")
             || line.contains("simulation(s) aborted")
@@ -77,6 +150,18 @@ fn run(netlist: &str, log: &mut String) -> Result<Waveform, String> {
     let bytes = fs::read(dir.path().join("wave.raw"))
         .map_err(|e| format!("Cannot read waveform data: {e}. Check the analysis directive."))?;
     let mut wave = parse_raw(&bytes)?;
+    if let Some(end) = stop_time
+        && wave.time.last().is_none_or(|t| *t < end * (1. - 1e-8))
+    {
+        return Err(format!(
+            "Transient analysis ended before the requested {end} s. See ngspice output."
+        ));
+    }
+    normalize(&mut wave, &sensors, netlist);
+    Ok(wave)
+}
+
+fn normalize(wave: &mut Waveform, sensors: &[(String, String)], netlist: &str) {
     for (node, component) in sensors {
         let internal_voltages = [
             format!("V({node})"),
@@ -91,7 +176,40 @@ fn run(netlist: &str, log: &mut String) -> Result<Waveform, String> {
         }
     }
     wave.logarithmic_frequency = crate::analysis::Settings::read(netlist).logarithmic_frequency();
-    Ok(wave)
+}
+
+#[cfg(unix)]
+fn suspend(child: &std::process::Child, pause: bool) -> Result<(), String> {
+    let status = Command::new("kill")
+        .args([
+            if pause { "-STOP" } else { "-CONT" },
+            &child.id().to_string(),
+        ])
+        .status()
+        .map_err(|e| e.to_string())?;
+    status
+        .success()
+        .then_some(())
+        .ok_or("Could not change simulation state".into())
+}
+#[cfg(windows)]
+fn suspend(child: &std::process::Child, pause: bool) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSuspendProcess(handle: *mut std::ffi::c_void) -> i32;
+        fn NtResumeProcess(handle: *mut std::ffi::c_void) -> i32;
+    }
+    let status = unsafe {
+        if pause {
+            NtSuspendProcess(child.as_raw_handle())
+        } else {
+            NtResumeProcess(child.as_raw_handle())
+        }
+    };
+    (status >= 0)
+        .then_some(())
+        .ok_or("Could not change simulation state".into())
 }
 
 #[cfg(test)]

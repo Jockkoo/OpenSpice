@@ -96,12 +96,6 @@ pub struct Source {
 }
 
 impl Source {
-    pub fn dialog_min_height(&self) -> f32 {
-        // Includes the source type, waveform fields, independent AC excitation,
-        // the component reference, title, and dialog action row.
-        (self.kind.spec().2.len() as f32 + 4.) * 28. + 74.
-    }
-
     fn defaults(kind: Kind) -> Self {
         Self {
             kind,

@@ -2,7 +2,9 @@ use crate::analysis::{Analysis, Settings};
 use crate::dock::{Dock, Layout as DockLayout, View};
 use crate::plot::{BACK, Plot};
 use crate::schematic::{Schematic, Tool};
-use crate::simulation::{EXAMPLE, Run, simulate};
+#[cfg(test)]
+use crate::simulation::simulate;
+use crate::simulation::{EXAMPLE, Run};
 use eframe::egui::{
     self, Button, Color32, Context, FontId, Frame, Layout, Panel, ScrollArea, TextEdit, Ui,
 };
@@ -81,6 +83,8 @@ enum Icon {
     Copy,
     Comment,
     Run,
+    Pause,
+    Stop,
     Plus,
     Minus,
     Fit,
@@ -393,6 +397,39 @@ fn draw_icon(p: &egui::Painter, center: egui::Pos2, icon: Icon, color: Color32, 
                 PLAY_COLORS,
             );
         }
+        Icon::Pause => {
+            for x in [1., 10.] {
+                polygon(
+                    &[(x, 1.), (x + 5., 1.), (x + 5., 16.), (x, 16.)],
+                    Color32::from_rgb(245, 191, 86),
+                    Stroke::new(scale, Color32::from_rgb(163, 110, 48)),
+                );
+                p.line_segment(
+                    [point(x + 1., 3.), point(x + 4., 3.)],
+                    Stroke::new(scale, Color32::LIGHT_YELLOW),
+                );
+            }
+        }
+        Icon::Stop => {
+            polygon(
+                &[
+                    (4., 0.),
+                    (12., 0.),
+                    (16., 4.),
+                    (16., 12.),
+                    (12., 16.),
+                    (4., 16.),
+                    (0., 12.),
+                    (0., 4.),
+                ],
+                Color32::from_rgb(225, 83, 86),
+                Stroke::new(scale, Color32::from_rgb(145, 52, 60)),
+            );
+            p.line_segment(
+                [point(4., 3.), point(12., 3.)],
+                Stroke::new(scale, Color32::LIGHT_RED),
+            );
+        }
         Icon::Run => {
             paint_play_triangle(
                 p,
@@ -648,6 +685,10 @@ pub struct Workbench {
     edited: bool,
     waveform_layout: WaveformLayout,
     show_netlist: bool,
+    control: Arc<crate::simulation::Control>,
+    progress: f64,
+    updates: Option<Receiver<(f64, Option<crate::waveform::Waveform>)>>,
+    live_plot: bool,
     show_directives: bool,
     show_toolbar: bool,
     current_hover: Option<String>,
@@ -738,6 +779,10 @@ impl Workbench {
                 _ => WaveformLayout::default(),
             },
             show_netlist: false,
+            control: Default::default(),
+            progress: 0.,
+            updates: None,
+            live_plot: false,
             show_directives: false,
             show_toolbar: true,
             current_hover: None,
@@ -913,13 +958,28 @@ impl Workbench {
         self.log.clear();
         self.edited = false;
         let (tx, rx) = mpsc::channel();
+        self.control = Default::default();
+        self.control
+            .live
+            .store(self.live_plot, std::sync::atomic::Ordering::Relaxed);
+        let control = self.control.clone();
+        self.progress = 0.;
+        let (updates, receiver) = mpsc::sync_channel(1);
+        self.updates = Some(receiver);
         self.state = State::Running(rx);
         let netlist = self.netlist.clone();
         let ctx = ctx.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("ngspice".into())
             .spawn(move || {
-                let _ = tx.send(simulate(&netlist));
+                let _ = tx.send(crate::simulation::controlled(
+                    &netlist,
+                    &control,
+                    |progress, wave| {
+                        let _ = updates.try_send((progress, wave));
+                        ctx.request_repaint();
+                    },
+                ));
                 ctx.request_repaint();
             })
         {
@@ -936,6 +996,16 @@ impl Workbench {
         let State::Running(rx) = &self.state else {
             return;
         };
+        if let Some((progress, wave)) = self.updates.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.progress = progress;
+            if let Some(data) = wave.filter(|w| w.analysis != Analysis::Op) {
+                if let Some(plot) = &mut self.plot {
+                    plot.refresh(data);
+                } else {
+                    self.plot = Some(Plot::new(data));
+                }
+            }
+        }
         match rx.try_recv() {
             Ok(run) => {
                 self.log = run.log;
@@ -955,6 +1025,9 @@ impl Workbench {
                             self.dock.arrange(self.waveform_layout.dock_layout());
                             self.dock.close_waveform();
                             self.plot = Some(Plot::new(data));
+                        }
+                        if self.control.mode.load(std::sync::atomic::Ordering::Relaxed) != 2 {
+                            self.progress = 1.;
                         }
                         self.state = State::Success;
                     }
@@ -1050,8 +1123,16 @@ impl Workbench {
                             ui.close();
                         }
                         for (name, document) in [
-                            ("Full bridge rectifier", include_str!("../examples/full-bridge-rectifier.cir")),
-                            ("Class A amplifier with a transformer and MOSFETs", include_str!("../examples/class-a-transformer-mosfet-amplifier.cir")),
+                            (
+                                "Full bridge rectifier",
+                                include_str!("../examples/full-bridge-rectifier.cir"),
+                            ),
+                            (
+                                "Class A amplifier with a transformer and MOSFETs",
+                                include_str!(
+                                    "../examples/class-a-transformer-mosfet-amplifier.cir"
+                                ),
+                            ),
                         ] {
                             if ui.button(name).clicked() {
                                 if let Err(error) = self.open_document_text(document, None) {
@@ -1140,6 +1221,14 @@ impl Workbench {
                 }
             });
             ui.menu_button("Plot Settings", |ui| {
+                if ui
+                    .checkbox(&mut self.live_plot, "Plot during simulation")
+                    .changed()
+                {
+                    self.control
+                        .live
+                        .store(self.live_plot, std::sync::atomic::Ordering::Relaxed);
+                }
                 ui.menu_button("Waveform layout", |ui| {
                     for layout in [
                         WaveformLayout::Above,
@@ -1286,8 +1375,38 @@ impl Workbench {
                 if tool(ui, ready, Icon::Configure, false, "Configure Simulation") {
                     self.configure_simulation();
                 }
-                if tool(ui, ready, Icon::Run, false, "Run the current netlist") {
-                    self.start(ui.ctx());
+                use std::sync::atomic::Ordering::Relaxed;
+                let mode = self.control.mode.load(Relaxed);
+                if tool(
+                    ui,
+                    ready || mode == 1,
+                    Icon::Run,
+                    false,
+                    "Run the current netlist",
+                ) {
+                    if ready {
+                        self.start(ui.ctx());
+                    } else {
+                        self.control.mode.store(0, Relaxed);
+                    }
+                }
+                if tool(
+                    ui,
+                    !ready && mode == 0,
+                    Icon::Pause,
+                    false,
+                    "Pause simulation",
+                ) {
+                    self.control.mode.store(1, Relaxed);
+                }
+                if tool(
+                    ui,
+                    !ready && mode != 2,
+                    Icon::Stop,
+                    false,
+                    "Stop simulation",
+                ) {
+                    self.control.mode.store(2, Relaxed);
                 }
                 if tool(
                     ui,
@@ -1514,6 +1633,14 @@ impl Workbench {
                             State::Success => ("Success", Color32::LIGHT_GREEN),
                             State::Failed(_) => ("Failed", Color32::LIGHT_RED),
                         };
+                        let mode = self.control.mode.load(std::sync::atomic::Ordering::Relaxed);
+                        let label = match (&self.state, mode) {
+                            (State::Running(_),1) => "Paused",
+                            (State::Running(_),2) => "Stopping",
+                            (State::Success,2) => "Stopped",
+                            _ => label,
+                        };
+                        if matches!(self.state,State::Running(_) | State::Success) { ui.label(format!("{:.0}%",self.progress*100.)); }
                         ui.colored_label(color, label);
                     });
                 });
@@ -1565,14 +1692,27 @@ impl Workbench {
                 .show(ui, |ui| self.directives_editor(ui));
         }
         if self.schematic.editor_open() || self.schematic.selector_open {
-            Panel::right("component editor").resizable(true).default_size(350.).min_size(300.)
-                .frame(pane_frame).show(ui, |ui| {
+            Panel::right("component editor")
+                .resizable(true)
+                .default_size(350.)
+                .min_size(300.)
+                .frame(pane_frame)
+                .show(ui, |ui| {
                     if self.schematic.selector_open {
-                        let height = ui.available_height() * if self.schematic.editor_open() { 0.45 } else { 1.0 };
-                        ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| self.schematic.component_selector(ui));
+                        let height = ui.available_height()
+                            * if self.schematic.editor_open() {
+                                0.45
+                            } else {
+                                1.0
+                            };
+                        ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                            self.schematic.component_selector(ui)
+                        });
                         ui.separator();
                     }
-                    if self.schematic.component_editor(ui, &mut self.netlist) { self.commit_edit(); }
+                    if self.schematic.component_editor(ui, &mut self.netlist) {
+                        self.commit_edit();
+                    }
                 });
         }
         if self.show_netlist {
@@ -1592,8 +1732,9 @@ impl Workbench {
             .show(ui, |ui| {
                 let mut dock = std::mem::take(&mut self.dock);
                 let mut probe = None;
-                let probing =
-                    self.plot.is_some() && !self.edited && matches!(self.state, State::Success);
+                let probing = self.plot.is_some()
+                    && !self.edited
+                    && matches!(self.state, State::Success | State::Running(_));
                 let had_traces = self.plot.as_ref().is_some_and(Plot::has_traces);
                 let show_plot = self.plot.is_some() && !dock.waveform_closed();
                 let previous_hover = self.current_hover.take();
