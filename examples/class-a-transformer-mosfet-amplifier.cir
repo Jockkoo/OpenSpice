@@ -1,0 +1,56 @@
+Class A Amplifier with a Transformer and MOSFETs
+* OpenSpice layout v1 (wide_transformer_windings:true,full_center_tapped_secondary:true,rotations:{"X3":6,"R1":3,"X1":0,"V3":2,"V1":1,"V2":0,"X4":2,"X2":0},positions:{"X2":(7,15),"V1":(-5,19),"V2":(6,19),"X1":(1,19),"V3":(11,19),"X3":(7,23),"R1":(25,19),"X4":(18,19)},wires:[((-5,17),(-1,17)),((-5,21),(-1,21)),((3,15),(5,15)),((3,19),(4,19)),((3,23),(5,23)),((7,20),(8,20)),((8,13),(12,13)),((8,17),(8,19)),((8,19),(8,20)),((8,19),(9,19)),((8,20),(8,21)),((8,25),(14,25)),((12,13),(15,13)),((13,19),(14,19)),((14,19),(16,19)),((14,23),(14,25)),((14,23),(16,23)),((15,13),(15,15)),((15,15),(16,15)),((20,17),(25,17)),((20,21),(25,21))],grounds:[(7,20)],powers:[])
+R1 n1 n6 100
+X4 n1 n6 n12 n13 n14 os_xfmr_ct_pol_1 ratio=2
+V3 n13 0 DC 12
+V2 n5 0 DC 4
+X3 n12 n10 0 os_nmos_adjust vto=3 kp=200m lambda=0 rd=0 rs=0 cgso=0 cgdo=0
+X2 n14 n2 0 os_nmos_adjust vto=3 kp=200m lambda=0 rd=0 rs=0 cgso=0 cgdo=0
+X1 n3 n4 n2 n5 n10 os_xfmr_ct ratio=1
+V1 n3 n4 SIN(0 0.1 500 0 0 0)
+.tran 5u 21m
+.subckt os_xfmr_multi_1_2 p1a p1b s1a s1b s2a s2b params: ratio=1
+Rp1ref p1b 0 1T
+Es1 s1a s1b p1a p1b {ratio}
+Fs1 p1a p1b Es1 {-ratio}
+Rs1ref s1b 0 1T
+Es2 s2a s2b p1a p1b {ratio}
+Fs2 p1a p1b Es2 {-ratio}
+Rs2ref s2b 0 1T
+.ends
+.subckt os_xfmr_multi_1_2_pol_1 pin1 pin2 pin3 pin4 pin5 pin6 params: ratio=1
+Xcore pin2 pin1 pin3 pin4 pin5 pin6 os_xfmr_multi_1_2 ratio={ratio}
+.ends
+.subckt os_xfmr p1 p2 s1 s2 params: ratio=1
+Esecondary s1 s2 p1 p2 {ratio}
+Fprimary p1 p2 Esecondary {-ratio}
+.ends
+.subckt os_xfmr_pol_2 pin1 pin2 pin3 pin4 params: ratio=1
+Xcore pin1 pin2 pin4 pin3 os_xfmr ratio={ratio}
+.ends
+.subckt os_xfmr_pol_3 pin1 pin2 pin3 pin4 params: ratio=1
+Xcore pin2 pin1 pin4 pin3 os_xfmr ratio={ratio}
+.ends
+.subckt os_xfmr_ct p1 p2 s1 tap s2 params: ratio=1
+Eupper s1 tap p1 p2 {ratio/2}
+Elower tap s2 p1 p2 {ratio/2}
+Fupper p1 p2 Eupper {-ratio/2}
+Flower p1 p2 Elower {-ratio/2}
+Rtapref tap 0 1T
+.ends
+.subckt os_nmos d g s
+M1 d g s s mm
+.model mm NMOS(VTO=1 KP=1m)
+.ends
+.subckt os_xfmr_ct_pol_1 p1 p2 s1 tap s2 params: ratio=1
+Eupper s1 tap p2 p1 {ratio/2}
+Elower tap s2 p2 p1 {ratio/2}
+Fupper p2 p1 Eupper {-ratio/2}
+Flower p2 p1 Elower {-ratio/2}
+Rtapref tap 0 1T
+.ends
+.subckt os_nmos_adjust d g s params: vto=1 kp=1m lambda=0 rd=0 rs=0 cgso=0 cgdo=0
+M1 d g s s mm
+.model mm NMOS(VTO={vto} KP={kp} LAMBDA={lambda} RD={rd} RS={rs} CGSO={cgso} CGDO={cgdo})
+.ends
+.end

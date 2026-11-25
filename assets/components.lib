@@ -1,4 +1,12 @@
 * OpenSpice built-in component models
+* Constant forward drop with a 10 mOhm on slope and 1 GOhm off resistance.
+.subckt os_diode_ideal a k params: vf=0.7
+B1 a k I={max(V(a,k)-vf,0)/0.01+V(a,k)/1e9}
+.ends
+* Piecewise linear diode. BV=0 disables reverse breakdown.
+.subckt os_diode_piecewise a k params: vf=0.7 ron=0.01 roff=1e9 bv=0
+B1 a k I={V(a,k)/roff + (1/ron-1/roff)*(max(V(a,k)-vf,0)-ternary_fcn(bv>0,max(-V(a,k)-bv,0),0))}
+.ends
 .subckt os_diode a k
 D1 a k md
 .model md D
@@ -18,6 +26,34 @@ D1 a k md
 .subckt os_led a k
 D1 a k md
 .model md D(IS=1e-19 N=2 RS=8 CJO=20p BV=5 IBV=10u)
+.ends
+.subckt os_diode_standard a k
+D1 a k md
+.model md D
+.ends
+.subckt os_diode_adjust a k params: is=1e-14 n=1 rs=0 cjo=0 vj=1 m=0.5 tt=0 bv=1e99 ibv=1m eg=1.11 xti=3 fc=0.5
+D1 a k md
+.model md D(IS={is} N={n} RS={rs} CJO={cjo} VJ={vj} M={m} TT={tt} BV={bv} IBV={ibv} EG={eg} XTI={xti} FC={fc})
+.ends
+.subckt os_rectifier_adjust a k params: is=7n n=1.8 rs=0.04 cjo=25p vj=1 m=0.5 tt=2u bv=100 ibv=10u eg=1.11 xti=3 fc=0.5
+D1 a k md
+.model md D(IS={is} N={n} RS={rs} CJO={cjo} VJ={vj} M={m} TT={tt} BV={bv} IBV={ibv} EG={eg} XTI={xti} FC={fc})
+.ends
+.subckt os_schottky_adjust a k params: is=2u n=1.05 rs=0.08 cjo=80p vj=1 m=0.5 tt=0 bv=40 ibv=1m eg=1.11 xti=3 fc=0.5
+D1 a k md
+.model md D(IS={is} N={n} RS={rs} CJO={cjo} VJ={vj} M={m} TT={tt} BV={bv} IBV={ibv} EG={eg} XTI={xti} FC={fc})
+.ends
+.subckt os_zener_adjust a k params: is=1p n=1.2 rs=2 cjo=80p vj=1 m=0.5 tt=0 bv=5.1 ibv=1m eg=1.11 xti=3 fc=0.5
+D1 a k md
+.model md D(IS={is} N={n} RS={rs} CJO={cjo} VJ={vj} M={m} TT={tt} BV={bv} IBV={ibv} EG={eg} XTI={xti} FC={fc})
+.ends
+.subckt os_led_adjust a k params: is=1e-19 n=2 rs=8 cjo=20p vj=1 m=0.5 tt=0 bv=5 ibv=10u eg=1.11 xti=3 fc=0.5
+D1 a k md
+.model md D(IS={is} N={n} RS={rs} CJO={cjo} VJ={vj} M={m} TT={tt} BV={bv} IBV={ibv} EG={eg} XTI={xti} FC={fc})
+.ends
+.subckt os_diode_standard_adjust a k params: is=1e-14 n=1 rs=0 cjo=0 vj=1 m=0.5 tt=0 bv=1e99 ibv=1m eg=1.11 xti=3 fc=0.5
+D1 a k md
+.model md D(IS={is} N={n} RS={rs} CJO={cjo} VJ={vj} M={m} TT={tt} BV={bv} IBV={ibv} EG={eg} XTI={xti} FC={fc})
 .ends
 .subckt os_npn c b e
 Q1 c b e mq
@@ -89,6 +125,8 @@ B1 out 0 V=min(V(vp),max(V(vn),V(pole)))
 .subckt os_xfmr p1 p2 s1 s2 params: ratio=1
 Esecondary s1 s2 p1 p2 {ratio}
 Fprimary p1 p2 Esecondary {-ratio}
+Rp2ref p2 0 1T
+Rs2ref s2 0 1T
 .ends
 .subckt os_xfmr_ct p1 p2 s1 tap s2 params: ratio=1
 Eupper s1 tap p1 p2 {ratio/2}

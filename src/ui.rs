@@ -767,7 +767,11 @@ impl Workbench {
 
     fn open_document(&mut self, path: &Path) -> Result<(), String> {
         let file = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let mut text = file.clone();
+        self.open_document_text(&file, Some(path.into()))
+    }
+
+    fn open_document_text(&mut self, file: &str, path: Option<PathBuf>) -> Result<(), String> {
+        let mut text = file.to_owned();
         let american = self.schematic.american_resistor;
         let light_canvas = self.schematic.light_canvas;
         let mut schematic = Schematic::default();
@@ -792,7 +796,7 @@ impl Workbench {
         schematic.fit_pending = true;
         self.schematic = schematic;
         self.netlist = text;
-        self.reset_document(Some(path.into()));
+        self.reset_document(path);
         Ok(())
     }
 
@@ -1039,13 +1043,25 @@ impl Workbench {
                     }
                 }
                 ui.separator();
-                if ui
-                    .add_enabled(ready && file_ready, Button::new("Load Example"))
-                    .clicked()
-                {
-                    self.load_example();
-                    ui.close();
-                }
+                ui.add_enabled_ui(ready && file_ready, |ui| {
+                    ui.menu_button("Load Examples", |ui| {
+                        if ui.button("RLC circuit").clicked() {
+                            self.load_example();
+                            ui.close();
+                        }
+                        for (name, document) in [
+                            ("Full bridge rectifier", include_str!("../examples/full-bridge-rectifier.cir")),
+                            ("Class A amplifier with a transformer and MOSFETs", include_str!("../examples/class-a-transformer-mosfet-amplifier.cir")),
+                        ] {
+                            if ui.button(name).clicked() {
+                                if let Err(error) = self.open_document_text(document, None) {
+                                    self.file_error = Some(error);
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
+                });
                 ui.separator();
                 if ui.button("Quit").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
