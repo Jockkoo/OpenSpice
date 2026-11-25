@@ -70,6 +70,10 @@ fn run(
         ".subckt os_xfmr p1 p2 s1 s2 params: ratio=1\nEsecondary s1 s2 p1 p2 {ratio}\nFprimary p1 p2 Esecondary {-ratio}\n.ends",
         ".subckt os_xfmr p1 p2 s1 s2 params: ratio=1\nEsecondary s1 s2 p1 p2 {ratio}\nFprimary p1 p2 Esecondary {-ratio}\nRp2ref p2 0 1T\nRs2ref s2 0 1T\n.ends",
     );
+    let deck = deck.replace(
+        "B1 a k I={V(a,k)/roff + (1/ron-1/roff)*(max(V(a,k)-vf,0)-ternary_fcn(bv>0,max(-V(a,k)-bv,0),0))}",
+        ".func os_knee(x) {ternary_fcn(x<=-1m,0,ternary_fcn(x>=1m,x,(x+1m)^2/4m))}\nB1 a k I={V(a,k)/roff + (1/ron-1/roff)*(os_knee(V(a,k)-vf)-ternary_fcn(bv>0,os_knee(-V(a,k)-bv),0))}",
+    );
     fs::write(dir.path().join("circuit.cir"), deck)
         .map_err(|e| format!("Cannot write netlist: {e}"))?;
     let output_path = dir.path().join("run.log");
@@ -125,7 +129,7 @@ fn run(
             }
             paused = mode == 1;
         }
-        if (transition || !paused && last.elapsed().as_millis() >= 450) {
+        if transition || !paused && last.elapsed().as_millis() >= 450 {
             last = std::time::Instant::now();
             if !paused && !control.live.load(Ordering::Relaxed) {
                 if let Some(progress) = raw_progress(&raw, stop_time) {
@@ -262,6 +266,49 @@ fn suspend(child: &std::process::Child, pause: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires ngspice on PATH"]
+    fn live_pause_resume_and_stop_keep_samples() {
+        let control = Control::default();
+        control.live.store(true, Ordering::Relaxed);
+        let mut updates = 0;
+        let run = controlled(
+            &EXAMPLE.replace(".tran 5u 21m", ".tran 50n 1"),
+            &control,
+            |progress, wave| {
+                assert!(progress > 0. && progress < 1.);
+                assert!(!wave.unwrap().time.is_empty());
+                updates += 1;
+                control.mode.store(
+                    match updates {
+                        1 => 1,
+                        2 => 0,
+                        _ => 2,
+                    },
+                    Ordering::Relaxed,
+                );
+            },
+        );
+        assert!(updates >= 3);
+        let wave = run.waveform.expect(&run.log);
+        assert!(wave.time.last().is_some_and(|t| *t > 0. && *t < 1.));
+    }
+
+    #[test]
+    #[ignore = "requires ngspice on PATH"]
+    fn bridge_finishes_at_requested_time_for_each_ratio() {
+        let example = include_str!("../examples/full-bridge-rectifier.cir");
+        for ratio in ["1", "0.05", "0.1"] {
+            let netlist = example.replace(
+                "X5 n6 n8 n3 n5 os_xfmr ratio=1",
+                &format!("X5 n6 n8 n3 n5 os_xfmr ratio={ratio}"),
+            );
+            let run = simulate(&netlist);
+            let wave = run.waveform.expect(&run.log);
+            assert!((wave.time.last().unwrap() - 1.).abs() < 1e-8);
+        }
+    }
 
     #[test]
     #[ignore = "requires ngspice on PATH"]

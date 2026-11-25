@@ -1,4 +1,7 @@
-# Run makepkg from the OpenSpice checkout.
+# Keep makepkg cleanup away from the Rust source directory.
+if [[ -n ${startdir:-} && ${BUILDDIR:-$startdir} -ef "$startdir" ]]; then
+    BUILDDIR="$startdir/target/makepkg"
+fi
 pkgname=openspice
 pkgver=0.2.0
 pkgrel=1
