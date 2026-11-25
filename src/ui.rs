@@ -1564,6 +1564,12 @@ impl Workbench {
                 .frame(pane_frame)
                 .show(ui, |ui| self.directives_editor(ui));
         }
+        if self.schematic.editor_open() {
+            Panel::right("component editor").resizable(true).default_size(350.).min_size(300.)
+                .frame(pane_frame).show(ui, |ui| {
+                    if self.schematic.component_editor(ui, &mut self.netlist) { self.commit_edit(); }
+                });
+        }
         if self.show_netlist {
             let width = ui.available_width();
             Panel::right("netlist")

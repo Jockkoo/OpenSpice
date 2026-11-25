@@ -1502,9 +1502,235 @@ impl Schematic {
         chosen
     }
 
+    pub fn editor_open(&self) -> bool { self.editing.is_some() }
+
+    pub fn component_editor(&mut self, ui: &mut Ui, text: &mut String) -> bool {
+        if let Some(mut edit) = self.editing.take() {
+            ui.heading("Component properties");
+            ui.separator();
+            let height = (ui.available_height() - 44.).max(24.);
+            let valid = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                    egui::Grid::new("component fields")
+                        .min_col_width(132.)
+                        .show(ui, |ui| {
+                            crate::ui::dialog_field(ui, "Reference", &mut edit.reference);
+                            if let Some(source) = &mut edit.source {
+                                source.show(ui, edit.original.starts_with(['I', 'i']));
+                                edit.value = source.definition();
+                            } else if edit.part == Part::Diode {
+                                ui.label("Diode type");
+                                egui::ComboBox::from_id_salt("diode type")
+                                    .width(crate::ui::DIALOG_FIELD_WIDTH)
+                                    .selected_text(diode_type(&edit.value).1)
+                                    .show_ui(ui, |ui| {
+                                        for (model, label) in DIODES {
+                                            ui.selectable_value(
+                                                &mut edit.value,
+                                                model.to_owned(),
+                                                label,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+                            } else if edit.part.spec().0 == 'X' {
+                                ui.label("Model");
+                                ui.strong(edit.part.spec().1);
+                                ui.end_row();
+                                for ((_, label), v) in
+                                    edit.part.parameters().iter().zip(&mut edit.parameters)
+                                {
+                                    crate::ui::dialog_field(ui, label, v);
+                                }
+                                if let Some((inputs, outputs)) = edit.part.transformer_windings() {
+                                    let tapped = edit.part == Part::CenterTappedTransformer;
+                                    let outputs = if tapped { 2 } else { outputs };
+                                    for index in 0..inputs + outputs {
+                                        let name = if index < inputs {
+                                            format!("Primary {}", index + 1)
+                                        } else if tapped {
+                                            if index == inputs {
+                                                "Upper secondary".into()
+                                            } else {
+                                                "Lower secondary".into()
+                                            }
+                                        } else {
+                                            format!("Secondary {}", index - inputs + 1)
+                                        };
+                                        let bit = 1 << index;
+                                        let mut reversed = edit.winding_polarity & bit != 0;
+                                        ui.label(name);
+                                        if ui.checkbox(&mut reversed, "Reverse polarity").changed()
+                                        {
+                                            edit.winding_polarity ^= bit;
+                                        }
+                                        ui.end_row();
+                                    }
+                                }
+                            } else {
+                                crate::ui::dialog_field(ui, "Value", &mut edit.value);
+                            }
+                            for ((_, label), value) in
+                                parasitic_fields(edit.part).iter().zip(&mut edit.parasitics)
+                            {
+                                crate::ui::dialog_field(ui, label, value);
+                            }
+                        });
+                    let valid_name = edit.reference.starts_with(|c: char| {
+                        c.eq_ignore_ascii_case(&edit.original.chars().next().unwrap())
+                    }) && edit
+                        .reference
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    let duplicate = cards(text).iter().any(|c| {
+                        c.name != edit.original && c.name.eq_ignore_ascii_case(&edit.reference)
+                    });
+                    let error = if !valid_name {
+                        Some("Keep the component prefix and use letters, numbers or underscores.")
+                    } else if duplicate {
+                        Some("This reference is already in use.")
+                    } else if edit.source.as_ref().is_some_and(|s| !s.valid()) {
+                        Some("Check waveform parameters and enter numeric AC magnitude and phase.")
+                    } else if edit.part == Part::Op
+                        && !matches!(
+                            (crate::analysis::number(&edit.parameters[0]), crate::analysis::number(&edit.parameters[1])),
+                            (Some(high), Some(low)) if high > low
+                        )
+                    {
+                        Some(
+                            "Enter two supply voltages with the positive rail above the negative rail.",
+                        )
+                    } else if edit.part.adjustable_transistor_model().is_some() {
+                        edit.part.parameters().iter().zip(&edit.parameters).find_map(|((key, _), value)| {
+                            match crate::analysis::number(value) {
+                                None => Some("Enter a numeric value for each model parameter."),
+                                Some(n) if matches!(*key, "bf" | "is" | "nf" | "kp" | "beta") && n <= 0. => {
+                                    Some("BF, IS, NF, KP and BETA must be positive where applicable.")
+                                }
+                                Some(n) if *key != "vto" && n < 0. => {
+                                    Some("Only VTO can be negative.")
+                                }
+                                _ => None,
+                            }
+                        })
+                    } else if edit.part != Part::Op
+                        && edit
+                            .parameters
+                            .iter()
+                            .any(|v| !crate::analysis::number(v.trim()).is_some_and(|n| n > 0.))
+                    {
+                        Some("Enter a positive value for each parameter.")
+                    } else if edit.parasitics.iter().any(|v| {
+                        !v.trim().is_empty()
+                            && !crate::analysis::number(v.trim()).is_some_and(|n| n >= 0.)
+                    }) {
+                        Some("Enter nonnegative parasitic values or leave them blank.")
+                    } else if edit.value.trim().is_empty() {
+                        Some("Enter a value.")
+                    } else {
+                        None
+                    };
+                    if let Some(msg) = error {
+                        ui.label(msg);
+                    }
+                    error.is_none()
+            }).inner;
+            ui.separator();
+            let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let apply = ui.horizontal(|ui| {
+                cancel |= ui.button("Cancel").clicked();
+                ui.add_enabled(valid, egui::Button::new("Apply")).clicked()
+            }).inner;
+            if apply {
+                if let Some(c) = cards(text).into_iter().find(|c| c.name == edit.original) {
+                    if edit.part.spec().0 == 'X' && edit.part != Part::Diode {
+                        let model = edit.part.adjustable_transistor_model().unwrap_or_else(|| {
+                            if matches!(edit.part, Part::CustomTransformer { .. }) {
+                                c.value.split_whitespace().next().unwrap()
+                            } else {
+                                edit.part.spec().2.split_whitespace().next().unwrap()
+                            }
+                        });
+                        let base = transformer_model(model).0;
+                        let model_name = if edit.part.transformer_windings().is_some()
+                            && edit.winding_polarity != 0
+                        {
+                            format!("{base}_pol_{}", edit.winding_polarity)
+                        } else {
+                            base.to_owned()
+                        };
+                        let mut fields = vec![model_name];
+                        for (key, value) in
+                            c.value.split_whitespace().filter_map(|s| s.split_once('='))
+                        {
+                            if !edit
+                                .part
+                                .parameters()
+                                .iter()
+                                .any(|(k, _)| k.eq_ignore_ascii_case(key))
+                            {
+                                fields.push(format!("{key}={value}"));
+                            }
+                        }
+                        for ((key, _), value) in edit.part.parameters().iter().zip(&edit.parameters)
+                        {
+                            fields.push(format!("{key}={}", value.trim()));
+                        }
+                        edit.value = fields.join(" ");
+                    }
+                    let line = c.line;
+                    let parasitics = parasitic_fields(edit.part)
+                        .iter()
+                        .zip(&edit.parasitics)
+                        .filter(|(_, value)| {
+                            crate::analysis::number(value.trim()).is_some_and(|n| n > 0.)
+                        })
+                        .map(|((key, _), value)| format!("{key}={}", value.trim()))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut replacement = format!(
+                        "{} {} {}",
+                        edit.reference,
+                        c.nodes.join(" "),
+                        edit.value.trim()
+                    );
+                    if !parasitics.is_empty() {
+                        replacement.push_str(PARASITICS_MARKER);
+                        replacement.push_str(&parasitics);
+                    }
+                    *text = text
+                        .lines()
+                        .enumerate()
+                        .map(|(i, l)| if i == line { replacement.as_str() } else { l })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n";
+                    if let Some(pos) = self.positions.remove(&edit.original) {
+                        self.positions.insert(edit.reference.clone(), pos);
+                    }
+                    if let Some(turns) = self.rotations.remove(&edit.original) {
+                        self.rotations.insert(edit.reference.clone(), turns);
+                    }
+                    self.rename_label(&edit.original, &edit.reference);
+                    if self.selected.remove(&Object::Part(edit.original)) {
+                        self.selected.insert(Object::Part(edit.reference));
+                    }
+                    if edit.part.spec().0 == 'X' {
+                        ensure_model(text, &edit.value);
+                    }
+                    self.index_parts(text);
+                    self.label_layout = None;
+                    self.snapshot = text.clone();
+                    return true;
+                }
+            } else if !cancel {
+                self.editing = Some(edit);
+            }
+        }
+        false
+    }
+
     fn accepts_tool_shortcuts(&self, ui: &Ui) -> bool {
-        self.editing.is_none()
-            && self.transformer_setup.is_none()
+        self.transformer_setup.is_none()
             && self.editing_power.is_none()
             && self.editing_comment.is_none()
             && self.new_comment.is_none()
@@ -3612,229 +3838,6 @@ impl Schematic {
             }
         }
 
-        if let Some(mut edit) = self.editing.take() {
-            let min_height = edit
-                .source
-                .as_ref()
-                .map(crate::source::Source::dialog_min_height);
-            let dialog = crate::ui::dialog_with_min_height(
-                ui.ctx(),
-                // egui remembers the modal's size by ID.
-                egui::Id::unique(("component properties", edit.part)),
-                "Component properties",
-                min_height,
-                |ui| {
-                    egui::Grid::new("component fields")
-                        .min_col_width(132.)
-                        .show(ui, |ui| {
-                            crate::ui::dialog_field(ui, "Reference", &mut edit.reference);
-                            if let Some(source) = &mut edit.source {
-                                source.show(ui, edit.original.starts_with(['I', 'i']));
-                                edit.value = source.definition();
-                            } else if edit.part == Part::Diode {
-                                ui.label("Diode type");
-                                egui::ComboBox::from_id_salt("diode type")
-                                    .width(crate::ui::DIALOG_FIELD_WIDTH)
-                                    .selected_text(diode_type(&edit.value).1)
-                                    .show_ui(ui, |ui| {
-                                        for (model, label) in DIODES {
-                                            ui.selectable_value(
-                                                &mut edit.value,
-                                                model.to_owned(),
-                                                label,
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
-                            } else if edit.part.spec().0 == 'X' {
-                                ui.label("Model");
-                                ui.strong(edit.part.spec().1);
-                                ui.end_row();
-                                for ((_, label), v) in
-                                    edit.part.parameters().iter().zip(&mut edit.parameters)
-                                {
-                                    crate::ui::dialog_field(ui, label, v);
-                                }
-                                if let Some((inputs, outputs)) = edit.part.transformer_windings() {
-                                    let tapped = edit.part == Part::CenterTappedTransformer;
-                                    let outputs = if tapped { 2 } else { outputs };
-                                    for index in 0..inputs + outputs {
-                                        let name = if index < inputs {
-                                            format!("Primary {}", index + 1)
-                                        } else if tapped {
-                                            if index == inputs {
-                                                "Upper secondary".into()
-                                            } else {
-                                                "Lower secondary".into()
-                                            }
-                                        } else {
-                                            format!("Secondary {}", index - inputs + 1)
-                                        };
-                                        let bit = 1 << index;
-                                        let mut reversed = edit.winding_polarity & bit != 0;
-                                        ui.label(name);
-                                        if ui.checkbox(&mut reversed, "Reverse polarity").changed()
-                                        {
-                                            edit.winding_polarity ^= bit;
-                                        }
-                                        ui.end_row();
-                                    }
-                                }
-                            } else {
-                                crate::ui::dialog_field(ui, "Value", &mut edit.value);
-                            }
-                            for ((_, label), value) in
-                                parasitic_fields(edit.part).iter().zip(&mut edit.parasitics)
-                            {
-                                crate::ui::dialog_field(ui, label, value);
-                            }
-                        });
-                    let valid_name = edit.reference.starts_with(|c: char| {
-                        c.eq_ignore_ascii_case(&edit.original.chars().next().unwrap())
-                    }) && edit
-                        .reference
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
-                    let duplicate = cards(text).iter().any(|c| {
-                        c.name != edit.original && c.name.eq_ignore_ascii_case(&edit.reference)
-                    });
-                    let error = if !valid_name {
-                        Some("Keep the component prefix and use letters, numbers or underscores.")
-                    } else if duplicate {
-                        Some("This reference is already in use.")
-                    } else if edit.source.as_ref().is_some_and(|s| !s.valid()) {
-                        Some("Check waveform parameters and enter numeric AC magnitude and phase.")
-                    } else if edit.part == Part::Op
-                        && !matches!(
-                            (crate::analysis::number(&edit.parameters[0]), crate::analysis::number(&edit.parameters[1])),
-                            (Some(high), Some(low)) if high > low
-                        )
-                    {
-                        Some(
-                            "Enter two supply voltages with the positive rail above the negative rail.",
-                        )
-                    } else if edit.part.adjustable_transistor_model().is_some() {
-                        edit.part.parameters().iter().zip(&edit.parameters).find_map(|((key, _), value)| {
-                            match crate::analysis::number(value) {
-                                None => Some("Enter a numeric value for each model parameter."),
-                                Some(n) if matches!(*key, "bf" | "is" | "nf" | "kp" | "beta") && n <= 0. => {
-                                    Some("BF, IS, NF, KP and BETA must be positive where applicable.")
-                                }
-                                Some(n) if *key != "vto" && n < 0. => {
-                                    Some("Only VTO can be negative.")
-                                }
-                                _ => None,
-                            }
-                        })
-                    } else if edit.part != Part::Op
-                        && edit
-                            .parameters
-                            .iter()
-                            .any(|v| !crate::analysis::number(v.trim()).is_some_and(|n| n > 0.))
-                    {
-                        Some("Enter a positive value for each parameter.")
-                    } else if edit.parasitics.iter().any(|v| {
-                        !v.trim().is_empty()
-                            && !crate::analysis::number(v.trim()).is_some_and(|n| n >= 0.)
-                    }) {
-                        Some("Enter nonnegative parasitic values or leave them blank.")
-                    } else if edit.value.trim().is_empty() {
-                        Some("Enter a value.")
-                    } else {
-                        None
-                    };
-                    if let Some(msg) = error {
-                        ui.label(msg);
-                    }
-                    crate::ui::dialog_actions(ui, "Apply", error.is_none(), true)
-                },
-            );
-            if dialog.inner {
-                if let Some(c) = cards(text).into_iter().find(|c| c.name == edit.original) {
-                    if edit.part.spec().0 == 'X' && edit.part != Part::Diode {
-                        let model = edit.part.adjustable_transistor_model().unwrap_or_else(|| {
-                            if matches!(edit.part, Part::CustomTransformer { .. }) {
-                                c.value.split_whitespace().next().unwrap()
-                            } else {
-                                edit.part.spec().2.split_whitespace().next().unwrap()
-                            }
-                        });
-                        let base = transformer_model(model).0;
-                        let model_name = if edit.part.transformer_windings().is_some()
-                            && edit.winding_polarity != 0
-                        {
-                            format!("{base}_pol_{}", edit.winding_polarity)
-                        } else {
-                            base.to_owned()
-                        };
-                        let mut fields = vec![model_name];
-                        for (key, value) in
-                            c.value.split_whitespace().filter_map(|s| s.split_once('='))
-                        {
-                            if !edit
-                                .part
-                                .parameters()
-                                .iter()
-                                .any(|(k, _)| k.eq_ignore_ascii_case(key))
-                            {
-                                fields.push(format!("{key}={value}"));
-                            }
-                        }
-                        for ((key, _), value) in edit.part.parameters().iter().zip(&edit.parameters)
-                        {
-                            fields.push(format!("{key}={}", value.trim()));
-                        }
-                        edit.value = fields.join(" ");
-                    }
-                    let line = c.line;
-                    let parasitics = parasitic_fields(edit.part)
-                        .iter()
-                        .zip(&edit.parasitics)
-                        .filter(|(_, value)| {
-                            crate::analysis::number(value.trim()).is_some_and(|n| n > 0.)
-                        })
-                        .map(|((key, _), value)| format!("{key}={}", value.trim()))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let mut replacement = format!(
-                        "{} {} {}",
-                        edit.reference,
-                        c.nodes.join(" "),
-                        edit.value.trim()
-                    );
-                    if !parasitics.is_empty() {
-                        replacement.push_str(PARASITICS_MARKER);
-                        replacement.push_str(&parasitics);
-                    }
-                    *text = text
-                        .lines()
-                        .enumerate()
-                        .map(|(i, l)| if i == line { replacement.as_str() } else { l })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        + "\n";
-                    if let Some(pos) = self.positions.remove(&edit.original) {
-                        self.positions.insert(edit.reference.clone(), pos);
-                    }
-                    if let Some(turns) = self.rotations.remove(&edit.original) {
-                        self.rotations.insert(edit.reference.clone(), turns);
-                    }
-                    self.rename_label(&edit.original, &edit.reference);
-                    if self.selected.remove(&Object::Part(edit.original)) {
-                        self.selected.insert(Object::Part(edit.reference));
-                    }
-                    if edit.part.spec().0 == 'X' {
-                        ensure_model(text, &edit.value);
-                    }
-                    self.index_parts(text);
-                    self.label_layout = None;
-                    self.snapshot = text.clone();
-                    return true;
-                }
-            } else if !dialog.should_close() {
-                self.editing = Some(edit);
-            }
-        }
         if changed && !annotations_only {
             let layout = if keep_label_layout {
                 self.label_layout.take()
