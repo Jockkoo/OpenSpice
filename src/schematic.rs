@@ -75,7 +75,8 @@ impl OrientationEdit {
     }
 }
 
-const DIODES: [(&str, &str); 5] = [
+const DIODES: [(&str, &str); 6] = [
+    ("os_diode_standard", "Standard diode"),
     ("os_diode", "Small-signal diode"),
     ("os_rectifier", "Rectifier"),
     ("os_schottky", "Schottky"),
@@ -90,7 +91,7 @@ fn diode_type(value: &str) -> (&'static str, &'static str) {
             value
                 .split_whitespace()
                 .next()
-                .is_some_and(|v| v.eq_ignore_ascii_case(model))
+                .is_some_and(|v| v.trim_end_matches("_adjust").eq_ignore_ascii_case(model))
         })
         .unwrap_or(DIODES[0])
 }
@@ -322,7 +323,7 @@ impl Part {
             Self::Inductor => ('L', "Inductor", "1m"),
             Self::Voltage => ('V', "Voltage source", "5"),
             Self::Current => ('I', "Current source", "1m"),
-            Self::Diode => ('X', "Diode", "os_diode"),
+            Self::Diode => ('X', "Diode", "os_diode_piecewise"),
             Self::Npn => ('X', "NPN transistor", "os_npn"),
             Self::Pnp => ('X', "PNP transistor", "os_pnp"),
             Self::Nmos => ('X', "NMOS", "os_nmos"),
@@ -471,7 +472,7 @@ fn cards(text: &str) -> Vec<Card<'_>> {
                                         (*p == Part::Diode
                                             && DIODES
                                                 .iter()
-                                                .any(|(key, _)| model.eq_ignore_ascii_case(key)))
+                                                .any(|(key, _)| model.trim_end_matches("_adjust").eq_ignore_ascii_case(key) || matches!(model, "os_diode_piecewise" | "os_diode_ideal")))
                                             || (*p == Part::Op
                                                 && model.eq_ignore_ascii_case("os_op"))
                                             || p.adjustable_transistor_model().is_some_and(|name| {
@@ -1525,20 +1526,37 @@ impl Schematic {
                                 source.show(ui, edit.original.starts_with(['I', 'i']));
                                 edit.value = source.definition();
                             } else if edit.part == Part::Diode {
-                                ui.label("Diode type");
-                                egui::ComboBox::from_id_salt("diode type")
-                                    .width(crate::ui::DIALOG_FIELD_WIDTH)
-                                    .selected_text(diode_type(&edit.value).1)
-                                    .show_ui(ui, |ui| {
-                                        for (model, label) in DIODES {
-                                            ui.selectable_value(
-                                                &mut edit.value,
-                                                model.to_owned(),
-                                                label,
-                                            );
-                                        }
-                                    });
+                                let original = edit.value.split_whitespace().next().unwrap_or("").to_owned();
+                                let was_ideal = matches!(original.as_str(), "os_diode_piecewise" | "os_diode_ideal");
+                                let mut ideal = was_ideal;
+                                ui.label("Model");
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut ideal, true, "Idealized");
+                                    ui.selectable_value(&mut ideal, false, "Realistic");
+                                });
                                 ui.end_row();
+                                let mut kind = diode_type(&original).0;
+                                if !ideal {
+                                    ui.label("Diode type");
+                                    egui::ComboBox::from_id_salt("diode type")
+                                        .selected_text(diode_type(kind).1).show_ui(ui, |ui| {
+                                            for (model, label) in DIODES { ui.selectable_value(&mut kind, model, label); }
+                                        });
+                                    ui.end_row();
+                                }
+                                let model = if ideal { "os_diode_piecewise".to_owned() } else { format!("{kind}_adjust") };
+                                let mut definition = model.clone();
+                                let defaults = include_str!("../assets/components.lib").lines()
+                                    .find(|l| l.split_whitespace().nth(1) == Some(model.as_str()) && l.starts_with(".subckt")).unwrap_or("");
+                                for (key, default) in defaults.split_whitespace().filter_map(|s| s.split_once('=')) {
+                                    let mut v = edit.value.split_whitespace().filter_map(|s| s.split_once('='))
+                                        .find(|(k,_)| *k == key && (original == model || original == "os_diode_ideal" && ideal))
+                                        .map_or(default, |(_,v)| v).to_owned();
+                                    let label = match key { "vf" => "Forward drop (V)", "ron" => "On resistance (Ω)", "roff" => "Off resistance (Ω)", "bv" => "Breakdown voltage (V)", _ => key };
+                                    crate::ui::dialog_field(ui, label, &mut v);
+                                    definition.push_str(&format!(" {key}={v}"));
+                                }
+                                edit.value = definition;
                             } else if edit.part.spec().0 == 'X' {
                                 ui.label("Model");
                                 ui.strong(edit.part.spec().1);
@@ -1593,7 +1611,9 @@ impl Schematic {
                     });
                     let error = if !valid_name {
                         Some("Keep the component prefix and use letters, numbers or underscores.")
-                    } else if duplicate {
+                    } else if edit.part == Part::Diode && edit.value.split_whitespace().skip(1).any(|s| {
+                        s.split_once('=').is_none_or(|(k,v)| crate::analysis::number(v).is_none_or(|n| !n.is_finite() || n < 0. || matches!(k,"ron"|"roff"|"is"|"n") && n == 0.))
+                    }) { Some("Enter valid numeric diode parameters.") } else if duplicate {
                         Some("This reference is already in use.")
                     } else if edit.source.as_ref().is_some_and(|s| !s.valid()) {
                         Some("Check waveform parameters and enter numeric AC magnitude and phase.")
