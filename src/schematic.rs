@@ -3356,15 +3356,20 @@ impl Schematic {
             if let Some((name, anchor)) = self.context_part.clone() {
                 let mut command = None;
                 r.context_menu(|ui| {
-                    for label in [
-                        "Edit component",
-                        "Rotate",
-                        "Mirror horizontally",
-                        "Mirror vertically",
-                        "Move",
-                        "Delete",
+                    ui.set_min_width(228.);
+                    for (label, shortcut) in [
+                        ("Edit component", None),
+                        ("Rotate", Some("Ctrl+R")),
+                        ("Mirror horizontally", Some("Ctrl+E")),
+                        ("Mirror vertically", Some("Ctrl+Shift+E")),
+                        ("Move", Some("M")),
+                        ("Delete", Some("Delete / Ctrl+X")),
                     ] {
-                        if ui.button(label).clicked() {
+                        let mut button = egui::Button::new(label);
+                        if let Some(shortcut) = shortcut {
+                            button = button.shortcut_text(shortcut);
+                        }
+                        if ui.add_sized([ui.available_width(), 0.], button).clicked() {
                             command = Some(label);
                             ui.close();
                         }
