@@ -639,7 +639,21 @@ pub fn upgrade_pole_pins(text: &mut String) {
     ensure_model(text, "os_pole_ext");
 }
 
+// Keep the existing comment format for saved circuits. Tolerance is metadata;
+// the simulator still receives the nominal value and the electrical parasitics.
 const PARASITICS_MARKER: &str = " $ openspice-parasitics ";
+const TOLERANCE_KEY: &str = "tol";
+
+fn tolerance_percent(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let percent = value
+        .strip_suffix('%')
+        .unwrap_or(value)
+        .trim()
+        .parse()
+        .ok()?;
+    (0. ..=100.).contains(&percent).then_some(percent)
+}
 
 fn parasitic_fields(part: Part) -> &'static [(&'static str, &'static str)] {
     match part {
@@ -774,6 +788,7 @@ struct Properties {
     parameters: Vec<String>,
     winding_polarity: u16,
     parasitics: Vec<String>,
+    tolerance: String,
     source: Option<crate::source::Source>,
     original: String,
     reference: String,
@@ -1628,7 +1643,24 @@ impl Schematic {
                                     let mut v = edit.value.split_whitespace().filter_map(|s| s.split_once('='))
                                         .find(|(k,_)| *k == key && (original == model || original == "os_diode_ideal" && ideal))
                                         .map_or(default, |(_,v)| v).to_owned();
-                                    let label = match key { "vf" => "Forward drop (V)", "ron" => "On resistance (Ω)", "roff" => "Off resistance (Ω)", "bv" => "Breakdown voltage (V)", _ => key };
+                                    let label = match key {
+                                        "vf" => "VF · Forward voltage drop (V)",
+                                        "ron" => "RON · On resistance (Ω)",
+                                        "roff" => "ROFF · Off resistance (Ω)",
+                                        "is" => "IS · Saturation current (A)",
+                                        "n" => "N · Emission coefficient",
+                                        "rs" => "RS · Series resistance (Ω)",
+                                        "cjo" => "CJO · Zero-bias capacitance (F)",
+                                        "vj" => "VJ · Junction potential (V)",
+                                        "m" => "M · Junction grading coefficient",
+                                        "tt" => "TT · Transit time (s)",
+                                        "bv" => "BV · Reverse breakdown voltage (V)",
+                                        "ibv" => "IBV · Current at breakdown (A)",
+                                        "eg" => "EG · Bandgap energy (eV)",
+                                        "xti" => "XTI · Saturation-current temp. exponent",
+                                        "fc" => "FC · Forward-bias capacitance coefficient",
+                                        _ => key,
+                                    };
                                     crate::ui::component_field(ui, label, &mut v);
                                     definition.push_str(&format!(" {key}={v}"));
                                 }
@@ -1669,6 +1701,9 @@ impl Schematic {
                                 }
                             } else {
                                 crate::ui::component_field(ui, "Value", &mut edit.value);
+                            }
+                            if !edit.parasitics.is_empty() {
+                                crate::ui::component_field(ui, "Tolerance (±%)", &mut edit.tolerance);
                             }
                             for ((_, label), value) in
                                 parasitic_fields(edit.part).iter().zip(&mut edit.parasitics)
@@ -1722,6 +1757,10 @@ impl Schematic {
                             .any(|v| !crate::analysis::number(v.trim()).is_some_and(|n| n > 0.))
                     {
                         Some("Enter a positive value for each parameter.")
+                    } else if !edit.tolerance.trim().is_empty()
+                        && tolerance_percent(&edit.tolerance).is_none()
+                    {
+                        Some("Enter a tolerance from 0 to 100%, or leave it blank.")
                     } else if edit.parasitics.iter().any(|v| {
                         !v.trim().is_empty()
                             && !crate::analysis::number(v.trim()).is_some_and(|n| n >= 0.)
@@ -1792,24 +1831,26 @@ impl Schematic {
                         edit.value = fields.join(" ");
                     }
                     let line = c.line;
-                    let parasitics = parasitic_fields(edit.part)
+                    let mut settings = parasitic_fields(edit.part)
                         .iter()
                         .zip(&edit.parasitics)
                         .filter(|(_, value)| {
                             crate::analysis::number(value.trim()).is_some_and(|n| n > 0.)
                         })
                         .map(|((key, _), value)| format!("{key}={}", value.trim()))
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                        .collect::<Vec<_>>();
+                    if let Some(percent) = tolerance_percent(&edit.tolerance) {
+                        settings.push(format!("{TOLERANCE_KEY}={percent}"));
+                    }
                     let mut replacement = format!(
                         "{} {} {}",
                         edit.reference,
                         c.nodes.join(" "),
                         edit.value.trim()
                     );
-                    if !parasitics.is_empty() {
+                    if !settings.is_empty() {
                         replacement.push_str(PARASITICS_MARKER);
-                        replacement.push_str(&parasitics);
+                        replacement.push_str(&settings.join(" "));
                     }
                     *text = text
                         .lines()
@@ -3450,13 +3491,13 @@ impl Schematic {
                     ));
                 } else if let Some(c) = cards(text).into_iter().find(|c| Some(c.name) == name) {
                     self.cancel();
+                    let (value, settings) = split_parasitics(c.part, c.value);
                     self.editing = Some(Properties {
                         part: c.part,
+                        tolerance: parasitic_value(settings, TOLERANCE_KEY).to_owned(),
                         parasitics: parasitic_fields(c.part)
                             .iter()
-                            .map(|(key, _)| {
-                                parasitic_value(split_parasitics(c.part, c.value).1, key).to_owned()
-                            })
+                            .map(|(key, _)| parasitic_value(settings, key).to_owned())
                             .collect(),
                         winding_polarity: transformer_model(
                             c.value.split_whitespace().next().unwrap_or(""),
@@ -3480,7 +3521,7 @@ impl Schematic {
                             .then(|| crate::source::Source::parse(c.value)),
                         original: c.name.into(),
                         reference: c.name.into(),
-                        value: split_parasitics(c.part, c.value).0.into(),
+                        value: value.into(),
                     });
                 }
             }
