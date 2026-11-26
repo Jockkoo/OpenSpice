@@ -1650,7 +1650,7 @@ impl Workbench {
                         .fill(TOOLBAR)
                         .corner_radius(PANE_RADIUS)
                         .outer_margin(egui::Margin::symmetric(4, 2))
-                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .inner_margin(egui::Margin::symmetric(6, 5))
                         .stroke(egui::Stroke::new(1., CHROME_EDGE)),
                 )
                 .show(ui, |ui| self.toolbar(ui));
