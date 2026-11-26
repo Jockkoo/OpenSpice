@@ -236,18 +236,6 @@ pub(crate) fn toolbar_surface(ui: &Ui, response: &egui::Response, active: bool) 
     Color32::WHITE
 }
 
-fn ribbon_group(ui: &mut Ui, label: &str, tools: impl FnOnce(&mut Ui)) {
-    let start = ui.next_widget_position();
-    tools(ui);
-    ui.painter().text(
-        egui::pos2(start.x + 2., ui.min_rect().top() - 1.),
-        egui::Align2::LEFT_BOTTOM,
-        label,
-        FontId::proportional(9.),
-        Color32::from_rgb(173, 190, 205),
-    );
-}
-
 fn tool(ui: &mut Ui, enabled: bool, icon: Icon, active: bool, hint: &str) -> bool {
     let response = ui.add_enabled_ui(enabled, |ui| {
         let (_, rect) = ui.allocate_space(TOOL_SIZE);
@@ -1429,141 +1417,137 @@ impl Workbench {
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(1., 1.);
-            ui.set_min_height(TOOL_SIZE.y);
-            ribbon_group(ui, "FILE", |ui| {
-                if tool(
-                    ui,
-                    self.file_picker.is_none(),
-                    Icon::Save,
-                    false,
-                    "Save schematic (Ctrl+S)",
-                ) {
-                    self.save_action(false, ui.ctx());
-                }
-            });
-            ui.separator();
-            ribbon_group(ui, "SIMULATION", |ui| {
-                let ready = !matches!(self.state, State::Running(_));
-                if tool(ui, ready, Icon::Configure, false, "Configure Simulation") {
-                    self.configure_simulation();
-                }
-                use std::sync::atomic::Ordering::Relaxed;
-                let mode = self.control.mode.load(Relaxed);
-                if tool(
-                    ui,
-                    ready || mode == 1,
-                    Icon::Run,
-                    false,
-                    "Run the current netlist",
-                ) {
-                    if ready {
-                        self.start(ui.ctx());
-                    } else {
-                        self.control.mode.store(0, Relaxed);
+        let viewport_width = ui.available_width();
+        ScrollArea::horizontal()
+            .id_salt("toolbar overflow")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(1., 0.);
+                    let row_start = ui.next_widget_position().x;
+                    if tool(
+                        ui,
+                        self.file_picker.is_none(),
+                        Icon::Save,
+                        false,
+                        "Save schematic (Ctrl+S)",
+                    ) {
+                        self.save_action(false, ui.ctx());
                     }
-                }
-                if tool(
-                    ui,
-                    !ready && mode == 0,
-                    Icon::Pause,
-                    false,
-                    "Pause simulation",
-                ) {
-                    self.control.mode.store(1, Relaxed);
-                }
-                if tool(
-                    ui,
-                    !ready && mode != 2,
-                    Icon::Stop,
-                    false,
-                    "Stop simulation",
-                ) {
-                    self.control.mode.store(2, Relaxed);
-                }
-                if tool(
-                    ui,
-                    true,
-                    Icon::Directives,
-                    self.show_directives,
-                    "SPICE directives (.)",
-                ) {
-                    self.show_directives = !self.show_directives;
-                }
-            });
-            ui.add_space(2.);
-            ui.separator();
-            ui.add_space(2.);
-            ribbon_group(ui, "EDIT", |ui| {
-                for (mode, icon, label) in [
-                    (Tool::Cursor, Icon::Cursor, "Cursor"),
-                    (Tool::Select, Icon::Select, "Select"),
-                    (Tool::Move, Icon::Move, "Move"),
-                    (Tool::Erase, Icon::Delete, "Delete"),
-                    (Tool::Copy, Icon::Copy, "Copy"),
-                    (Tool::Comment, Icon::Comment, "Add comment (T)"),
-                ] {
-                    if tool(ui, true, icon, self.schematic.tool == mode, label) {
-                        self.schematic.cancel();
-                        self.schematic.tool = mode;
+                    ui.separator();
+                    let ready = !matches!(self.state, State::Running(_));
+                    if tool(ui, ready, Icon::Configure, false, "Configure Simulation") {
+                        self.configure_simulation();
+                    }
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mode = self.control.mode.load(Relaxed);
+                    if tool(
+                        ui,
+                        ready || mode == 1,
+                        Icon::Run,
+                        false,
+                        "Run the current netlist",
+                    ) {
+                        if ready {
+                            self.start(ui.ctx());
+                        } else {
+                            self.control.mode.store(0, Relaxed);
+                        }
+                    }
+                    if tool(
+                        ui,
+                        !ready && mode == 0,
+                        Icon::Pause,
+                        false,
+                        "Pause simulation",
+                    ) {
+                        self.control.mode.store(1, Relaxed);
+                    }
+                    if tool(
+                        ui,
+                        !ready && mode != 2,
+                        Icon::Stop,
+                        false,
+                        "Stop simulation",
+                    ) {
+                        self.control.mode.store(2, Relaxed);
+                    }
+                    if tool(
+                        ui,
+                        true,
+                        Icon::Directives,
+                        self.show_directives,
+                        "SPICE directives (.)",
+                    ) {
+                        self.show_directives = !self.show_directives;
+                    }
+                    ui.add_space(2.);
+                    ui.separator();
+                    ui.add_space(2.);
+                    for (mode, icon, label) in [
+                        (Tool::Cursor, Icon::Cursor, "Cursor"),
+                        (Tool::Select, Icon::Select, "Select"),
+                        (Tool::Move, Icon::Move, "Move"),
+                        (Tool::Erase, Icon::Delete, "Delete"),
+                        (Tool::Copy, Icon::Copy, "Copy"),
+                        (Tool::Comment, Icon::Comment, "Add comment (T)"),
+                    ] {
+                        if tool(ui, true, icon, self.schematic.tool == mode, label) {
+                            self.schematic.cancel();
+                            self.schematic.tool = mode;
+                            self.dock.reveal_schematic();
+                        }
+                    }
+                    ui.add_space(2.);
+                    ui.separator();
+                    ui.add_space(2.);
+                    if self.schematic.picker(ui) {
                         self.dock.reveal_schematic();
                     }
-                }
-            });
-            ui.add_space(2.);
-            ui.separator();
-            ui.add_space(2.);
-            ribbon_group(ui, "PLACEMENT", |ui| {
-                if self.schematic.picker(ui) {
-                    self.dock.reveal_schematic();
-                }
-            });
 
-            if ui.available_width() < 140. {
-                ui.end_row();
-            }
-            let zoom_width = ui.available_width();
-            ui.allocate_ui_with_layout(
-                egui::vec2(zoom_width, TOOL_SIZE.y),
-                Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    let zoom = format!("{:.0}%", self.schematic.zoom_percent());
-                    ui.menu_button(zoom, |ui| {
-                        ui.set_min_width(116.);
-                        for percent in [50., 100., 200.] {
-                            if ui.button(format!("{percent:.0}%")).clicked() {
-                                self.dock.reveal_schematic();
-                                self.schematic.set_zoom_percent(percent);
-                                ui.close();
+                    let tools_width = ui.next_widget_position().x - row_start;
+                    let zoom_width = (viewport_width - tools_width).max(140.);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(zoom_width, TOOL_SIZE.y),
+                        Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let zoom = format!("{:.0}%", self.schematic.zoom_percent());
+                            ui.menu_button(zoom, |ui| {
+                                ui.set_min_width(116.);
+                                for percent in [50., 100., 200.] {
+                                    if ui.button(format!("{percent:.0}%")).clicked() {
+                                        self.dock.reveal_schematic();
+                                        self.schematic.set_zoom_percent(percent);
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Zoom to fit").clicked() {
+                                    self.dock.reveal_schematic();
+                                    self.schematic.fit_pending = true;
+                                    ui.close();
+                                }
+                            })
+                            .response
+                            .on_hover_text("Schematic zoom");
+                            for (icon, steps, hint) in [
+                                (Icon::Fit, 0., "Zoom schematic to fit"),
+                                (Icon::Plus, 1., "Zoom schematic in"),
+                                (Icon::Minus, -1., "Zoom schematic out"),
+                            ] {
+                                if tool(ui, true, icon, false, hint) {
+                                    self.dock.reveal_schematic();
+                                    if steps == 0. {
+                                        self.schematic.fit_pending = true;
+                                    } else {
+                                        self.schematic.zoom(steps, None);
+                                    }
+                                }
                             }
-                        }
-                        ui.separator();
-                        if ui.button("Zoom to fit").clicked() {
-                            self.dock.reveal_schematic();
-                            self.schematic.fit_pending = true;
-                            ui.close();
-                        }
-                    })
-                    .response
-                    .on_hover_text("Schematic zoom");
-                    for (icon, steps, hint) in [
-                        (Icon::Fit, 0., "Zoom schematic to fit"),
-                        (Icon::Plus, 1., "Zoom schematic in"),
-                        (Icon::Minus, -1., "Zoom schematic out"),
-                    ] {
-                        if tool(ui, true, icon, false, hint) {
-                            self.dock.reveal_schematic();
-                            if steps == 0. {
-                                self.schematic.fit_pending = true;
-                            } else {
-                                self.schematic.zoom(steps, None);
-                            }
-                        }
-                    }
-                },
-            );
-        });
+                        },
+                    );
+                });
+            });
     }
 }
 
@@ -1666,12 +1650,7 @@ impl Workbench {
                         .fill(TOOLBAR)
                         .corner_radius(PANE_RADIUS)
                         .outer_margin(egui::Margin::symmetric(4, 2))
-                        .inner_margin(egui::Margin {
-                            left: 8,
-                            right: 8,
-                            top: 12,
-                            bottom: 1,
-                        })
+                        .inner_margin(egui::Margin::symmetric(6, 3))
                         .stroke(egui::Stroke::new(1., CHROME_EDGE)),
                 )
                 .show(ui, |ui| self.toolbar(ui));
