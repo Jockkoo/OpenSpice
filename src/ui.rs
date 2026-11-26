@@ -67,7 +67,7 @@ const FIELD: Color32 = Color32::from_rgb(26, 27, 30);
 const HOVER: Color32 = Color32::from_rgb(52, 56, 63);
 const CYAN: Color32 = Color32::from_rgb(143, 183, 207);
 const ACTIVE_TOOL: Color32 = Color32::from_rgb(56, 70, 84);
-pub(crate) const TOOL_SIZE: egui::Vec2 = egui::vec2(32., 32.);
+pub(crate) const TOOL_SIZE: egui::Vec2 = egui::vec2(36., 36.);
 
 pub(crate) const DIALOG_FIELD_WIDTH: f32 = 140.;
 
@@ -536,10 +536,42 @@ fn draw_icon(p: &egui::Painter, center: egui::Pos2, icon: Icon, color: Color32, 
             }
         }
         Icon::Delete => {
-            p.circle_stroke(point(3.5, 12.5), 2.5 * scale, pen);
-            p.circle_stroke(point(11.5, 12.5), 2.5 * scale, pen);
-            path(&[(5., 10.5), (14., 1.)]);
-            path(&[(10., 10.5), (1., 1.)]);
+            let steel = Color32::from_rgb(210, 224, 231);
+            let bevel = Color32::from_rgb(104, 133, 149);
+            let red = Color32::from_rgb(255, 82, 65);
+            let red_shadow = Color32::from_rgb(155, 42, 43);
+            let handle_stroke = Stroke::new(1.85 * scale, red);
+
+            // The handle loops stay open against both the toolbar and the schematic.
+            p.line_segment(
+                [point(4.9, 8.8), point(9.7, 7.1)],
+                Stroke::new(2.3 * scale, red_shadow),
+            );
+            polygon(
+                &[
+                    (7.4, 8.6),
+                    (8.8, 6.4),
+                    (16.5, 3.6),
+                    (15.7, 5.3),
+                    (14.5, 6.3),
+                ],
+                bevel,
+                Stroke::NONE,
+            );
+            polygon(
+                &[(8.7, 7.6), (9.5, 6.4), (16.1, 4.), (14.8, 5.4)],
+                steel,
+                Stroke::NONE,
+            );
+            polygon(
+                &[(7.1, 8.1), (9.5, 2.1), (10.7, 0.7), (12.3, 0.), (9.5, 9.)],
+                steel,
+                Stroke::new(0.55 * scale, bevel),
+            );
+            p.line_segment([point(8.3, 7.7), point(7.3, 10.9)], handle_stroke);
+            p.circle_stroke(point(3.1, 9.5), 2.35 * scale, handle_stroke);
+            p.circle_stroke(point(8.1, 13.3), 2.45 * scale, handle_stroke);
+            p.circle_filled(point(8.4, 8.2), 0.55 * scale, red_shadow);
         }
         Icon::Copy => {
             path(&[(2., 10.), (2., 1.), (11., 1.), (11., 4.)]);
@@ -1488,7 +1520,7 @@ impl Workbench {
                 }
             });
 
-            if ui.available_width() < 154. {
+            if ui.available_width() < 164. {
                 ui.end_row();
             }
             let zoom_width = ui.available_width();
@@ -1637,8 +1669,8 @@ impl Workbench {
                         .inner_margin(egui::Margin {
                             left: 8,
                             right: 8,
-                            top: 14,
-                            bottom: 1,
+                            top: 16,
+                            bottom: 3,
                         })
                         .stroke(egui::Stroke::new(1., CHROME_EDGE)),
                 )
