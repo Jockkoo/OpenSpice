@@ -1423,9 +1423,9 @@ impl Schematic {
                 .margin(egui::Margin::symmetric(10, 6)),
         );
         let query = self.search.trim().to_lowercase();
-        let available = ui.available_height();
-        let preview_height = (available * 0.5).clamp(56., 184.);
-        let height = (available - preview_height - 12.).max(24.);
+        let available = (ui.available_height() - 12.).max(0.);
+        let preview_height = (available * 0.5).min(184.);
+        let height = available - preview_height;
         let parts = || {
             Part::ALL
                 .into_iter()
@@ -1439,6 +1439,8 @@ impl Schematic {
             self.preview_part = parts().next();
         }
         egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .min_scrolled_height(0.)
             .max_height(height)
             .show(ui, |ui| {
                 for part in parts() {
@@ -1584,8 +1586,10 @@ impl Schematic {
         if let Some(mut edit) = self.editing.take() {
             ui.heading("Component properties");
             ui.separator();
-            let height = (ui.available_height() - 44.).max(24.);
-            let valid = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+            let button_size = vec2(82., 30.);
+            let footer_height = button_size.y + 12. + ui.spacing().item_spacing.y * 3.;
+            let height = (ui.available_height() - footer_height).max(0.);
+            let valid = egui::ScrollArea::vertical().min_scrolled_height(0.).max_height(height).auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 28.;
                     egui::Grid::new("component fields")
                         .num_columns(2)
@@ -1733,12 +1737,21 @@ impl Schematic {
                     }
                     error.is_none()
             }).inner;
-            ui.separator();
+            ui.add_space(4.);
+            ui.add(egui::Separator::default().spacing(4.));
+            ui.add_space(4.);
             let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
             let apply = ui
-                .horizontal(|ui| {
-                    cancel |= ui.button("Cancel").clicked();
-                    ui.add_enabled(valid, egui::Button::new("Apply")).clicked()
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.;
+                    let primary = egui::Button::new(egui::RichText::new("Apply").strong())
+                        .fill(ui.visuals().selection.bg_fill)
+                        .min_size(button_size);
+                    let apply = ui.add_enabled(valid, primary).clicked();
+                    cancel |= ui
+                        .add(egui::Button::new("Cancel").min_size(button_size))
+                        .clicked();
+                    apply
                 })
                 .inner;
             if apply {

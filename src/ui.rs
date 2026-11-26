@@ -1749,29 +1749,46 @@ impl Workbench {
                 .frame(pane_frame)
                 .show(ui, |ui| self.directives_editor(ui));
         }
-        if self.schematic.editor_open() || self.schematic.selector_open {
+        let editor_open = self.schematic.editor_open();
+        let selector_open = self.schematic.selector_open;
+        if editor_open || selector_open {
             Panel::right("component editor")
                 .resizable(true)
                 .show_separator_line(false)
                 .default_size(430.)
                 .min_size(420.)
-                .frame(pane_frame)
+                .frame(Frame::NONE)
                 .show(ui, |ui| {
-                    if self.schematic.selector_open {
-                        let height = ui.available_height()
-                            * if self.schematic.editor_open() {
-                                0.45
+                    if selector_open && editor_open {
+                        let height = ui.available_height();
+                        let minimum = (height * 0.4).min(170.);
+                        let selector = Panel::top("component selector split")
+                            .resizable(true)
+                            .show_separator_line(false)
+                            .default_size((height * 0.45).clamp(minimum, height - minimum))
+                            .size_range(minimum..=height - minimum)
+                            .frame(pane_frame)
+                            .show(ui, |ui| {
+                                ui.set_min_height(ui.available_height());
+                                self.schematic.component_selector(ui);
+                            });
+                        let grip = selector.response.rect.center_bottom();
+                        ui.painter().line_segment(
+                            [grip - egui::vec2(14., 0.), grip + egui::vec2(14., 0.)],
+                            egui::Stroke::new(1., ui.visuals().widgets.inactive.fg_stroke.color),
+                        );
+                    }
+                    egui::CentralPanel::default()
+                        .frame(pane_frame)
+                        .show(ui, |ui| {
+                            if editor_open {
+                                if self.schematic.component_editor(ui, &mut self.netlist) {
+                                    self.commit_edit();
+                                }
                             } else {
-                                1.0
-                            };
-                        ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
-                            self.schematic.component_selector(ui)
+                                self.schematic.component_selector(ui);
+                            }
                         });
-                        ui.separator();
-                    }
-                    if self.schematic.component_editor(ui, &mut self.netlist) {
-                        self.commit_edit();
-                    }
                 });
         }
         if self.show_netlist {
