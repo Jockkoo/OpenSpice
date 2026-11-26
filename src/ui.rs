@@ -67,7 +67,7 @@ const FIELD: Color32 = Color32::from_rgb(26, 27, 30);
 const HOVER: Color32 = Color32::from_rgb(52, 56, 63);
 const CYAN: Color32 = Color32::from_rgb(143, 183, 207);
 const ACTIVE_TOOL: Color32 = Color32::from_rgb(56, 70, 84);
-pub(crate) const TOOL_SIZE: egui::Vec2 = egui::vec2(36., 36.);
+pub(crate) const TOOL_SIZE: egui::Vec2 = egui::vec2(30., 28.);
 
 pub(crate) const DIALOG_FIELD_WIDTH: f32 = 140.;
 
@@ -240,10 +240,10 @@ fn ribbon_group(ui: &mut Ui, label: &str, tools: impl FnOnce(&mut Ui)) {
     let start = ui.next_widget_position();
     tools(ui);
     ui.painter().text(
-        egui::pos2(start.x + 2., ui.min_rect().top() - 2.),
+        egui::pos2(start.x + 2., ui.min_rect().top() - 1.),
         egui::Align2::LEFT_BOTTOM,
         label,
-        FontId::proportional(10.),
+        FontId::proportional(9.),
         Color32::from_rgb(173, 190, 205),
     );
 }
@@ -1430,7 +1430,7 @@ impl Workbench {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(2., 2.);
+            ui.spacing_mut().item_spacing = egui::vec2(1., 1.);
             ui.set_min_height(TOOL_SIZE.y);
             ribbon_group(ui, "FILE", |ui| {
                 if tool(
@@ -1492,9 +1492,9 @@ impl Workbench {
                     self.show_directives = !self.show_directives;
                 }
             });
-            ui.add_space(4.);
+            ui.add_space(2.);
             ui.separator();
-            ui.add_space(4.);
+            ui.add_space(2.);
             ribbon_group(ui, "EDIT", |ui| {
                 for (mode, icon, label) in [
                     (Tool::Cursor, Icon::Cursor, "Cursor"),
@@ -1511,16 +1511,16 @@ impl Workbench {
                     }
                 }
             });
-            ui.add_space(4.);
+            ui.add_space(2.);
             ui.separator();
-            ui.add_space(4.);
+            ui.add_space(2.);
             ribbon_group(ui, "PLACEMENT", |ui| {
                 if self.schematic.picker(ui) {
                     self.dock.reveal_schematic();
                 }
             });
 
-            if ui.available_width() < 164. {
+            if ui.available_width() < 140. {
                 ui.end_row();
             }
             let zoom_width = ui.available_width();
@@ -1669,8 +1669,8 @@ impl Workbench {
                         .inner_margin(egui::Margin {
                             left: 8,
                             right: 8,
-                            top: 16,
-                            bottom: 3,
+                            top: 12,
+                            bottom: 1,
                         })
                         .stroke(egui::Stroke::new(1., CHROME_EDGE)),
                 )
