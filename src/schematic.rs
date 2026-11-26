@@ -3358,16 +3358,18 @@ impl Schematic {
                 r.context_menu(|ui| {
                     ui.set_min_width(228.);
                     for (label, shortcut) in [
-                        ("Edit component", None),
                         ("Rotate", Some("Ctrl+R")),
                         ("Mirror horizontally", Some("Ctrl+E")),
                         ("Mirror vertically", Some("Ctrl+Shift+E")),
                         ("Move", Some("M")),
                         ("Delete", Some("Delete / Ctrl+X")),
+                        ("Component properties…", None),
                     ] {
                         let mut button = egui::Button::new(label);
                         if let Some(shortcut) = shortcut {
                             button = button.shortcut_text(shortcut);
+                        } else {
+                            button = button.right_text("");
                         }
                         if ui.add_sized([ui.available_width(), 0.], button).clicked() {
                             command = Some(label);
@@ -3381,7 +3383,7 @@ impl Schematic {
                     self.selected.clear();
                     self.selected.insert(Object::Part(name.clone()));
                     match command {
-                        "Edit component" => requested_editor = Some(name),
+                        "Component properties…" => requested_editor = Some(name),
                         "Rotate" => changed |= self.change_orientation(OrientationEdit::Rotate),
                         "Mirror horizontally" => {
                             changed |= self.change_orientation(OrientationEdit::MirrorHorizontal)

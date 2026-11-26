@@ -3483,7 +3483,7 @@ mod tests {
             );
         }
         let output = frame(&mut app, &ctx, vec![]);
-        click(&mut app, &ctx, locate(&output, "Edit component"));
+        click(&mut app, &ctx, locate(&output, "Component properties…"));
         let output = frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, locate(&output, "R1"));
         let output = frame(
